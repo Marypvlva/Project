@@ -320,16 +320,29 @@ def train_one_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     noise_std: float,
-) -> float:
+) -> tuple[float, float, float]:
     """
     Обучает CDAE одну эпоху.
 
-    Возвращает средний loss за эпоху.
+    Возвращает:
+        MSE
+        MAE
+        R²
     """
     model.train()
 
-    total_loss = 0.0
-    total_samples = 0
+    # Сумма квадратов ошибок для MSE и R².
+    sum_squared_error = 0.0
+
+    # Сумма абсолютных ошибок для MAE.
+    sum_absolute_error = 0.0
+
+    # Для расчёта R² нам нужны статистики target.
+    target_sum = 0.0
+    target_squared_sum = 0.0
+
+    # Общее количество значений-пикселей.
+    total_elements = 0
 
     for batch_index, batch in enumerate(dataloader):
         clean_frames = extract_frames(batch)
@@ -337,26 +350,23 @@ def train_one_epoch(
         # Приводим изображения к float32.
         clean_frames = clean_frames.float()
 
-        # На первом batch особенно важно сразу проверить,
-        # что Dataset отдаёт данные правильного формата.
+        # Проверяем первый batch.
         if batch_index == 0:
             validate_frames(clean_frames)
 
         clean_frames = clean_frames.to(device)
 
-        # Создаём повреждённую версию исходных кадров.
+        # Добавляем шум.
         noisy_frames = add_gaussian_noise(
             clean_frames=clean_frames,
             noise_std=noise_std,
         )
 
-        # Обнуляем градиенты предыдущего шага.
         optimizer.zero_grad(set_to_none=True)
 
-        # CDAE пытается восстановить чистую картинку.
+        # Восстанавливаем изображение.
         reconstructed_frames = model(noisy_frames)
 
-        # Архитектура обязана возвращать изображение того же размера.
         if reconstructed_frames.shape != clean_frames.shape:
             raise ValueError(
                 "CDAE output shape does not match target shape. "
@@ -364,38 +374,85 @@ def train_one_epoch(
                 f"target: {tuple(clean_frames.shape)}."
             )
 
-        # Ошибка между восстановленным и настоящим чистым кадром.
+        # MSE используется как функция потерь для обучения.
         loss = loss_fn(
             reconstructed_frames,
             clean_frames,
         )
 
-        # Защита от NaN / infinity.
         if not torch.isfinite(loss):
             raise FloatingPointError(
                 f"Non-finite loss detected: {loss.item()}"
             )
 
-        # Считаем производные.
         loss.backward()
-
-        # Обновляем веса CDAE.
         optimizer.step()
 
-        batch_size = clean_frames.shape[0]
+        # -----------------------------------------------------
+        # Метрики
+        # -----------------------------------------------------
+        # detach() нужен, чтобы расчёт метрик не участвовал
+        # в графе вычисления градиентов.
+        with torch.no_grad():
+            predictions = reconstructed_frames.detach()
+            targets = clean_frames.detach()
 
-        total_loss += loss.item() * batch_size
-        total_samples += batch_size
+            errors = predictions - targets
 
-    if total_samples == 0:
+            sum_squared_error += (
+                errors.pow(2).sum().item()
+            )
+
+            sum_absolute_error += (
+                errors.abs().sum().item()
+            )
+
+            target_sum += targets.sum().item()
+
+            target_squared_sum += (
+                targets.pow(2).sum().item()
+            )
+
+            total_elements += targets.numel()
+
+    if total_elements == 0:
         raise RuntimeError(
-            "DataLoader produced zero samples. "
+            "DataLoader produced zero elements. "
             "Check Dataset and input data."
         )
 
-    average_loss = total_loss / total_samples
+    # ---------------------------------------------------------
+    # MSE
+    # ---------------------------------------------------------
+    mse = sum_squared_error / total_elements
 
-    return average_loss
+    # ---------------------------------------------------------
+    # MAE
+    # ---------------------------------------------------------
+    mae = sum_absolute_error / total_elements
+
+    # ---------------------------------------------------------
+    # R²
+    #
+    # R² = 1 - SSE / SST
+    #
+    # SST = sum((y - mean(y))²)
+    #     = sum(y²) - sum(y)² / N
+    # ---------------------------------------------------------
+    total_sum_of_squares = (
+        target_squared_sum
+        - (target_sum ** 2) / total_elements
+    )
+
+    if total_sum_of_squares <= 1e-12:
+        r2 = float("nan")
+    else:
+        r2 = (
+            1.0
+            - sum_squared_error / total_sum_of_squares
+        )
+
+    return mse, mae, r2
 
 
 def save_model_weights(
@@ -532,7 +589,7 @@ def main() -> None:
     # ---------------------------------------------------------
 
     for epoch in range(1, args.epochs + 1):
-        average_loss = train_one_epoch(
+        mse, mae, r2 = train_one_epoch(
             model=model,
             dataloader=dataloader,
             optimizer=optimizer,
@@ -543,7 +600,9 @@ def main() -> None:
 
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} "
-            f"| MSE loss: {average_loss:.6f}"
+            f"| MSE: {mse:.6f} "
+            f"| MAE: {mae:.6f} "
+            f"| R²: {r2:.6f}"
         )
 
         # Перезаписываем актуальные веса после каждой эпохи.
@@ -556,7 +615,7 @@ def main() -> None:
             model=model,
             optimizer=optimizer,
             epoch=epoch,
-            loss=average_loss,
+            loss=mse,
             checkpoint_dir=args.checkpoint_dir,
         )
 
