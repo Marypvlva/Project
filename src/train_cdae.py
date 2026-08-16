@@ -18,7 +18,7 @@ from cdae_model import CDAE
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-
+IMAGE_SIZE = 128
 
 def parse_args() -> argparse.Namespace:
     """
@@ -198,14 +198,18 @@ def extract_frames(batch) -> torch.Tensor:
 
     Вариант 1:
         dataset возвращает:
-        (frame, laser_params, target)
+    (frame, process_params, time, target)
+
+    где:
+    process_params = [power, speed, thickness]
 
     Вариант 2:
         dataset возвращает словарь:
         {
-            "frame": ...,
-            "laser_params": ...,
-            "target": ...
+        "frame": ...,
+        "process_params": ...,
+        "time": ...,
+        "target": ...
         }
 
     Вариант 3:
@@ -250,7 +254,7 @@ def validate_frames(frames: torch.Tensor) -> None:
     Проверяет формат изображений.
 
     Ожидаем:
-        [batch_size, 3, 64, 64]
+    [batch_size, 3, 128, 128]
 
     и диапазон:
         [0, 1]
@@ -268,9 +272,9 @@ def validate_frames(frames: torch.Tensor) -> None:
             f"but received shape {tuple(frames.shape)}."
         )
 
-    if frames.shape[2:] != (64, 64):
+    if frames.shape[2:] != (IMAGE_SIZE, IMAGE_SIZE):
         raise ValueError(
-            "Expected frame size 64x64, "
+            f"Expected frame size {IMAGE_SIZE}x{IMAGE_SIZE}, "
             f"but received shape {tuple(frames.shape)}."
         )
 
@@ -504,7 +508,7 @@ def main() -> None:
     # Model
     # ---------------------------------------------------------
 
-    model = CDAE()
+    model = CDAE(img_size=IMAGE_SIZE)
 
     model = model.to(device)
 
