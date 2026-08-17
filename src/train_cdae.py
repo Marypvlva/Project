@@ -1,3 +1,8 @@
+"""
+Обучение CDAE.
+
+Здесь только: batch["frame"] [B, 3, 128, 128] в [0, 1] → шум → CDAE → MSE.
+"""
 from __future__ import annotations
 
 import argparse
