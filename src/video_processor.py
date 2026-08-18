@@ -1,8 +1,12 @@
 from pathlib import Path
+from collections import OrderedDict
 
 import cv2
 import numpy as np
 import torch
+
+# Сколько MP4 держим открытыми. Для обхода по видео хватает 2–4.
+_MAX_OPEN_CAPS = 4
 
 
 class VideoProcessor:
@@ -34,8 +38,12 @@ class VideoProcessor:
         self.frame_size = (int(width), int(height))
         self.position_step = float(position_step)
 
-        # Здесь хранятся только небольшие метаданные видео, а не сами кадры.
+        # Небольшие метаданные (fps, число кадров) — не сами кадры.
         self._video_info_cache = {}
+        # Открытые VideoCapture: key -> cap. LRU, чтобы не держать 246 файлов.
+        self._caps: OrderedDict[str, cv2.VideoCapture] = OrderedDict()
+        # Последний успешно прочитанный индекс кадра по файлу.
+        self._last_frame_idx: dict[str, int] = {}
 
     def get_video_info(self, video_path):
         """Получить FPS, число кадров, размер и длительность MP4."""
@@ -50,17 +58,11 @@ class VideoProcessor:
         if cache_key in self._video_info_cache:
             return self._video_info_cache[cache_key]
 
-        cap = cv2.VideoCapture(str(video_path))
-        try:
-            if not cap.isOpened():
-                raise RuntimeError(f"Не удалось открыть MP4: {video_path}")
-
-            fps = float(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        finally:
-            cap.release()
+        cap = self._get_cap(cache_key)
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         if not np.isfinite(fps) or fps <= 0:
             raise ValueError(f"Некорректный FPS: {fps}")
@@ -114,25 +116,60 @@ class VideoProcessor:
         frame_idx = int(round(position * (total_frames - 1)))
         return max(0, min(frame_idx, total_frames - 1))
 
+    def _get_cap(self, cache_key: str) -> cv2.VideoCapture:
+        """Вернуть открытый VideoCapture, не переоткрывая файл на каждый кадр."""
+        cap = self._caps.get(cache_key)
+        if cap is not None and cap.isOpened():
+            self._caps.move_to_end(cache_key)
+            return cap
+        if cap is not None:
+            cap.release()
+            self._caps.pop(cache_key, None)
+            self._last_frame_idx.pop(cache_key, None)
+
+        cap = cv2.VideoCapture(cache_key)
+        if not cap.isOpened():
+            raise RuntimeError(f"Не удалось открыть MP4: {cache_key}")
+
+        while len(self._caps) >= _MAX_OPEN_CAPS:
+            old_key, old_cap = self._caps.popitem(last=False)
+            old_cap.release()
+            self._last_frame_idx.pop(old_key, None)
+
+        self._caps[cache_key] = cap
+        self._last_frame_idx[cache_key] = -1
+        return cap
+
+    def close(self) -> None:
+        """Закрыть все закэшированные VideoCapture."""
+        for cap in self._caps.values():
+            cap.release()
+        self._caps.clear()
+        self._last_frame_idx.clear()
+
     def read_mp4_frame(self, video_path, position):
         """Прочитать один исходный BGR-кадр по относительной позиции."""
         video_path = Path(video_path)
         info = self.get_video_info(video_path)
-
+        cache_key = str(video_path.resolve())
         frame_idx = self.position_to_frame_index(
             position=position,
             total_frames=info["total_frames"],
         )
 
-        cap = cv2.VideoCapture(str(video_path))
-        try:
-            if not cap.isOpened():
-                raise RuntimeError(f"Не удалось открыть MP4: {video_path}")
+        cap = self._get_cap(cache_key)
+        last_idx = self._last_frame_idx.get(cache_key, -1)
 
+        # Следующий кадр подряд — без seek, только cap.read().
+        if last_idx >= 0 and frame_idx == last_idx + 1:
+            ret, frame = cap.read()
+        else:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-        finally:
-            cap.release()
+
+        if not ret or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
 
         if not ret or frame is None:
             raise RuntimeError(
@@ -140,6 +177,7 @@ class VideoProcessor:
                 f"для позиции {float(position):.3f}: {video_path}"
             )
 
+        self._last_frame_idx[cache_key] = frame_idx
         return frame
 
     def preprocess_frame(self, frame):

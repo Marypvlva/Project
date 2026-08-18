@@ -198,6 +198,7 @@ class LIGVideoDataset(Dataset):
             raise ValueError("Не найдено папок Sample 1, Sample 2, ...")
 
         positions = self.processor.get_position_grid()
+        n_checked = 0
 
         for sample_dir in sample_dirs:
             sample_name = sample_dir.name
@@ -213,9 +214,14 @@ class LIGVideoDataset(Dataset):
                 )
                 continue
 
-            video_files = sorted(sample_dir.glob("*.mp4"))
+            video_dir = sample_dir / "mp4"
+            if not video_dir.is_dir():
+                print(f"[INFO] В '{sample_name}' нет подпапки mp4/.")
+                continue
+
+            video_files = sorted(video_dir.glob("*.mp4"))
             if not video_files:
-                print(f"[INFO] В '{sample_name}' нет MP4-файлов.")
+                print(f"[INFO] В '{sample_name}/mp4' нет MP4-файлов.")
                 continue
 
             for video_path in video_files:
@@ -256,6 +262,9 @@ class LIGVideoDataset(Dataset):
                     # Эта проверка одновременно подтверждает, что MP4 существует,
                     # открывается и содержит корректное число кадров/FPS.
                     video_info = self.processor.get_video_info(video_path)
+                    n_checked += 1
+                    if n_checked == 1 or n_checked % 20 == 0:
+                        print(f"[INDEX] opened {n_checked} videos...", flush=True)
 
                     for position in positions:
                         self.samples.append(

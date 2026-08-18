@@ -204,21 +204,11 @@ def _load_dataset_class():
         from dataset import LIGTemporalDataset
 
         return LIGTemporalDataset
-    except ImportError:
-        pass
-    try:
-        from dataset import LIGDataset
-
-        return LIGDataset
-    except ImportError:
-        pass
-    try:
-        from dataset import LIGVideoDataset
-
-        return LIGVideoDataset
     except ImportError as exc:
         raise SystemExit(
-            "Не найден dataset.LIGTemporalDataset / LIGDataset — нужен код от #2."
+            "Нет LIGTemporalDataset: покадровый LIGVideoDataset для трансформера "
+            "не подходит (нужен frames [T,3,H,W] + frame_mask). "
+            "Сначала temporal-режим в dataset.py, потом этот скрипт."
         ) from exc
 
 

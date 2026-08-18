@@ -1,26 +1,36 @@
 """
 Обучение регрессора сопротивления поверх предобученного CDAE.
 
-Ключи батча от LIGVideoDataset:
+Данные — LIGVideoDataset + split_dataset_by_video (код коллеги, без правок):
+  один CSV, деление ПО ЦЕЛЫМ ВИДЕО, z-score params только по train.
+
+Ключи батча:
   frame                         — [B, 3, 128, 128], float [0, 1]
-  laser_params / params         — [B, 3] power, speed, distance
+  laser_params / params         — [B, 3] power, speed, distance (z-scored)
   position / time               — [B, 1] относительная позиция в видео [0, 1]
   target                        — [B, 1] сопротивление в кОм
 
-Метрики: logs/regression_metrics.csv + консоль. Best по val MAE.
+Один сэмпл = один кадр. Один mp4 → много кадров с одним R.
+Метрики: logs/regression_metrics.csv. Best по val MAE.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import inspect
+import json
+import random
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Sampler, Subset
+
+_SRC_DIR = Path(__file__).resolve().parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from cdae_model import (
     ResistanceRegressor,
@@ -29,11 +39,15 @@ from cdae_model import (
     load_regressor,
     save_regressor,
 )
+from dataset import LIGVideoDataset, split_dataset_by_video
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_VIDEO_ROOT = Path("/home/jupyter/filestore/dataset")
+DEFAULT_METADATA = DEFAULT_VIDEO_ROOT / "metadata.csv"
 DEFAULT_CDAE_CKPT = PROJECT_ROOT / "checkpoints" / "cdae_weights.pth"
 DEFAULT_OUT_CKPT = PROJECT_ROOT / "checkpoints" / "regressor.pt"
 DEFAULT_METRICS_CSV = PROJECT_ROOT / "logs" / "regression_metrics.csv"
+IMAGE_SIZE = 128
 
 METRICS_FIELDS = [
     "epoch",
@@ -171,40 +185,70 @@ def _format_epoch_line(row: dict[str, Any]) -> str:
     return "  ".join(parts)
 
 
-def _load_dataset_class():
-    """LIGVideoDataset коллеги; запасной алиас LIGDataset."""
-    try:
-        from dataset import LIGVideoDataset
-
-        return LIGVideoDataset
-    except ImportError:
-        pass
-    try:
-        from dataset import LIGDataset
-
-        return LIGDataset
-    except ImportError as exc:
-        raise SystemExit(
-            "Не найден dataset.LIGVideoDataset / LIGDataset."
-        ) from exc
+def _to_float_list(values: Any) -> Optional[list[float]]:
+    if values is None:
+        return None
+    return [float(x) for x in list(values)]
 
 
-def _make_dataset(
-    dataset_cls: type,
-    metadata_path: Path,
-    video_dir: Path,
-) -> Dataset:
-    kwargs: dict[str, Any] = {"metadata_path": metadata_path}
-    params = inspect.signature(dataset_cls.__init__).parameters
-    if "video_root" in params:
-        kwargs["video_root"] = video_dir
-    elif "video_dir" in params:
-        kwargs["video_dir"] = video_dir
+class VideoGroupedSubsetSampler(Sampler[int]):
+    """
+    Кадры одного mp4 идут подряд (по position), порядок видео перемешивается.
+
+    Работает по Subset от split_dataset_by_video: индексы локальные 0..len(subset)-1.
+    """
+
+    def __init__(self, subset: Subset, *, seed: int = 42) -> None:
+        if not isinstance(subset, Subset):
+            raise TypeError("VideoGroupedSubsetSampler ждёт torch Subset")
+        base = subset.dataset
+        if not hasattr(base, "samples"):
+            raise TypeError("Базовый датасет должен иметь .samples")
+
+        groups: dict[str, list[int]] = {}
+        for local_idx, global_idx in enumerate(subset.indices):
+            sample = base.samples[int(global_idx)]
+            key = str(sample["video_path"])
+            groups.setdefault(key, []).append(local_idx)
+        for local_idxs in groups.values():
+            local_idxs.sort(
+                key=lambda i: float(base.samples[int(subset.indices[i])]["position"])
+            )
+        self._groups = list(groups.values())
+        self._seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self._seed + self._epoch)
+        order = list(self._groups)
+        rng.shuffle(order)
+        self._epoch += 1
+        for group in order:
+            yield from group
+
+    def __len__(self) -> int:
+        return sum(len(group) for group in self._groups)
+
+
+def _make_loader(
+    subset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    seed: int,
+    grouped: bool,
+) -> DataLoader:
+    kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if grouped:
+        kwargs["sampler"] = VideoGroupedSubsetSampler(subset, seed=seed)
     else:
-        raise TypeError(
-            f"{dataset_cls.__name__} не принимает video_root / video_dir"
-        )
-    return dataset_cls(**kwargs)
+        kwargs["shuffle"] = False
+    return DataLoader(subset, **kwargs)
 
 
 def train_regression(
@@ -219,6 +263,8 @@ def train_regression(
     device: str | torch.device = "cpu",
     unfreeze_encoder_after: Optional[int] = None,
     encoder_lr: float = 1e-5,
+    extra_config: Optional[dict[str, Any]] = None,
+    test_loader: Optional[DataLoader] = None,
 ) -> ResistanceRegressor:
     """
     load CDAE → freeze encoder → Huber на R[кОм] →
@@ -232,6 +278,7 @@ def train_regression(
     device = torch.device(device)
     out_ckpt = Path(out_ckpt)
     metrics_csv = Path(metrics_csv)
+    extra_config = extra_config or {}
     _init_metrics_csv(metrics_csv)
 
     cdae = load_cdae(cdae_ckpt, map_location=device)
@@ -249,9 +296,9 @@ def train_regression(
     best_mae = float("inf")
     saved_once = False
 
-    print(f"метрики по эпохам → {metrics_csv}")
-    print(f"cdae_ckpt={cdae_ckpt}")
-    print(f"epochs={epochs}  device={device}")
+    print(f"метрики по эпохам → {metrics_csv}", flush=True)
+    print(f"cdae_ckpt={cdae_ckpt}", flush=True)
+    print(f"epochs={epochs}  device={device}", flush=True)
 
     for epoch in range(epochs):
         if unfreeze_encoder_after is not None and epoch == unfreeze_encoder_after:
@@ -269,17 +316,27 @@ def train_regression(
                     },
                 ]
             )
-            print(f"[epoch {epoch}] encoder разморожен, lr={encoder_lr}")
+            print(f"[epoch {epoch}] encoder разморожен, lr={encoder_lr}", flush=True)
 
         _set_train_modes(model)
+        n_batches = len(train_loader)
 
-        for batch in train_loader:
+        for batch_index, batch in enumerate(train_loader):
             b = _move_batch(batch, device)
             pred = model(b["frame"], b["params"], b["time"])
             loss = criterion(pred, b["target"])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            if (
+                batch_index == 0
+                or (batch_index + 1) % 50 == 0
+                or (batch_index + 1) == n_batches
+            ):
+                print(
+                    f"  batch {batch_index + 1}/{n_batches}  huber={loss.item():.4f}",
+                    flush=True,
+                )
 
         train_m = evaluate(model, train_loader, device, criterion=criterion_sum)
         val_m = evaluate(model, val_loader, device, criterion=criterion_sum)
@@ -287,7 +344,7 @@ def train_regression(
         is_best = 0
         if val_m["mae"] < best_mae:
             best_mae = val_m["mae"]
-            save_regressor(model, out_ckpt, cdae=cdae)
+            save_regressor(model, out_ckpt, cdae=cdae, extra_config=extra_config)
             saved_once = True
             is_best = 1
 
@@ -304,35 +361,53 @@ def train_regression(
             "is_best": is_best,
         }
         _append_metrics_csv(metrics_csv, row)
-        print(_format_epoch_line(row))
+        print(_format_epoch_line(row), flush=True)
 
     if not saved_once:
-        save_regressor(model, out_ckpt, cdae=cdae)
-        print(f"сохранено (fallback): {out_ckpt}")
+        save_regressor(model, out_ckpt, cdae=cdae, extra_config=extra_config)
+        print(f"сохранено (fallback): {out_ckpt}", flush=True)
     else:
-        # Вернуть best-веса
         model = load_regressor(out_ckpt, cdae=cdae, map_location=device)
         model.to(device)
-        print(f"лучший чекпоинт (по val MAE): {out_ckpt}  mae={best_mae:.4f}")
+        print(
+            f"лучший чекпоинт (по val MAE): {out_ckpt}  mae={best_mae:.4f}",
+            flush=True,
+        )
 
-    print(f"таблица метрик: {metrics_csv}")
+    if test_loader is not None and len(test_loader) > 0:
+        test_m = evaluate(model, test_loader, device, criterion=criterion_sum)
+        print(
+            f"test  huber={test_m['huber']:.4f}  "
+            f"mae={test_m['mae']:.4f}  mse={test_m['mse']:.4f}  r2={test_m['r2']:.4f}",
+            flush=True,
+        )
+
+    print(f"таблица метрик: {metrics_csv}", flush=True)
     return model
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Обучение регрессора сопротивления поверх CDAE")
+    p = argparse.ArgumentParser(
+        description="Обучение регрессора сопротивления поверх CDAE"
+    )
     p.add_argument("--cdae-ckpt", type=Path, default=DEFAULT_CDAE_CKPT)
     p.add_argument("--out-ckpt", type=Path, default=DEFAULT_OUT_CKPT)
     p.add_argument("--metrics-csv", type=Path, default=DEFAULT_METRICS_CSV)
-    p.add_argument("--metadata", type=Path, default=PROJECT_ROOT / "data2" / "table.xlsx")
-    p.add_argument("--val-metadata", type=Path, default=PROJECT_ROOT / "data2" / "table_val.xlsx")
-    p.add_argument("--video-dir", type=Path, default=PROJECT_ROOT / "data2")
+    p.add_argument("--metadata", type=Path, default=DEFAULT_METADATA)
+    p.add_argument("--video-dir", type=Path, default=DEFAULT_VIDEO_ROOT)
+    p.add_argument(
+        "--position-step",
+        type=float,
+        default=0.02,
+        help="Шаг позиции кадра: 0.02 → 2%, 4%, ..., 98%.",
+    )
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--encoder-lr", type=float, default=1e-5)
     p.add_argument("--unfreeze-after", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--device",
         type=str,
@@ -343,7 +418,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
-    dataset_cls = _load_dataset_class()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     if not Path(args.cdae_ckpt).exists():
         raise SystemExit(
@@ -351,32 +427,76 @@ def main() -> None:
             "Сначала train_cdae.py → checkpoints/cdae_weights.pth"
         )
     if not Path(args.metadata).exists():
-        raise SystemExit(f"нет train metadata: {args.metadata}")
-    if not Path(args.val_metadata).exists():
-        raise SystemExit(f"нет val metadata: {args.val_metadata}")
+        raise SystemExit(f"нет metadata: {args.metadata}")
+    if not Path(args.video_dir).exists():
+        raise SystemExit(f"нет video-dir: {args.video_dir}")
+    if not 0.0 < args.position_step < 1.0:
+        raise SystemExit("--position-step must be in (0, 1).")
 
-    train_dataset: Dataset = _make_dataset(
-        dataset_cls,
+    print("=" * 60, flush=True)
+    print("REGRESSION TRAINING", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Device:       {args.device}", flush=True)
+    print(f"Metadata:     {args.metadata}", flush=True)
+    print(f"Video dir:    {args.video_dir}", flush=True)
+    print(f"CDAE ckpt:    {args.cdae_ckpt}", flush=True)
+    print(f"Pos. step:    {args.position_step}", flush=True)
+    print(f"Epochs:       {args.epochs}", flush=True)
+    print(f"Batch size:   {args.batch_size}", flush=True)
+    print("=" * 60, flush=True)
+    print("Indexing videos (open each mp4 once)...", flush=True)
+
+    dataset = LIGVideoDataset(
         metadata_path=args.metadata,
-        video_dir=args.video_dir,
+        video_root=args.video_dir,
+        frame_size=(IMAGE_SIZE, IMAGE_SIZE),
+        position_step=args.position_step,
     )
-    val_dataset: Dataset = _make_dataset(
-        dataset_cls,
-        metadata_path=args.val_metadata,
-        video_dir=args.video_dir,
+    train_dataset, val_dataset, test_dataset, split_info = split_dataset_by_video(
+        dataset,
+        seed=args.seed,
+        normalize_laser_params=True,
     )
 
-    train_loader = DataLoader(
+    laser_mean = _to_float_list(split_info.get("laser_mean"))
+    laser_std = _to_float_list(split_info.get("laser_std"))
+    extra_config = {
+        "laser_mean": laser_mean,
+        "laser_std": laser_std,
+        "position_step": float(args.position_step),
+        "split_seed": int(args.seed),
+    }
+
+    norm_path = Path(args.metrics_csv).with_name("regression_norm.json")
+    norm_path.parent.mkdir(parents=True, exist_ok=True)
+    with norm_path.open("w", encoding="utf-8") as f:
+        json.dump(extra_config, f, indent=2, ensure_ascii=False)
+    print(f"laser mean/std → {norm_path}", flush=True)
+
+    pin_memory = str(args.device).startswith("cuda")
+    train_loader = _make_loader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        seed=args.seed,
+        grouped=True,
     )
-    val_loader = DataLoader(
+    val_loader = _make_loader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        seed=args.seed,
+        grouped=False,
+    )
+    test_loader = _make_loader(
+        test_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        seed=args.seed,
+        grouped=False,
     )
 
     train_regression(
@@ -390,7 +510,10 @@ def main() -> None:
         device=args.device,
         unfreeze_encoder_after=args.unfreeze_after,
         encoder_lr=args.encoder_lr,
+        extra_config=extra_config,
+        test_loader=test_loader,
     )
+
 
 if __name__ == "__main__":
     main()

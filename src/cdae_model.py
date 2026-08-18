@@ -299,8 +299,13 @@ def load_regressor(
     return model
 
 
-def save_regressor(model: ResistanceRegressor, path: PathLike, cdae: Optional[CDAE] = None) -> None:
-    """Сохранить регрессор (state_dict + config)."""
+def save_regressor(
+    model: ResistanceRegressor,
+    path: PathLike,
+    cdae: Optional[CDAE] = None,
+    extra_config: Optional[dict] = None,
+) -> None:
+    """Сохранить регрессор (state_dict + config). extra_config — laser_mean/std и т.п."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     base_channels = (
@@ -314,6 +319,8 @@ def save_regressor(model: ResistanceRegressor, path: PathLike, cdae: Optional[CD
         "img_size": cdae.img_size if cdae is not None else DEFAULT_IMG_SIZE,
         "base_channels": base_channels,
     }
+    if extra_config:
+        cfg.update(extra_config)
     # Размеры головы вытаскиваем из модулей
     img_linear = model.img_proj[1]
     param_linear = model.param_proj[0]

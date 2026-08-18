@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
@@ -26,6 +26,8 @@ from dataset import LIGVideoDataset
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 IMAGE_SIZE = 128
+DEFAULT_VIDEO_ROOT = Path("/home/jupyter/filestore/dataset")
+DEFAULT_METADATA = DEFAULT_VIDEO_ROOT / "metadata.csv"
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,16 +37,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metadata",
         type=Path,
-        default=PROJECT_ROOT / "data" / "metadata.csv",
-        help="CSV с колонками sample, video_id, filename, power_mW, speed_mm_s, "
-        "distance_um, resistance_kOhm_sq.",
+        default=DEFAULT_METADATA,
+        help="CSV metadata. По умолчанию /home/jupyter/filestore/dataset/metadata.csv",
     )
     parser.add_argument(
         "--video-dir",
         type=Path,
-        default=PROJECT_ROOT / "file_store" / "dataset",
-        help="Корень с папками Sample 1, Sample 2, ... (video_root). "
-        "В DataSphere: file_store/dataset",
+        default=DEFAULT_VIDEO_ROOT,
+        help="Корень с Sample 1/mp4, Sample 2/mp4, ... "
+        "По умолчанию /home/jupyter/filestore/dataset",
     )
     parser.add_argument(
         "--position-step",
@@ -154,6 +155,36 @@ def build_dataset(
     )
 
 
+class VideoGroupedSampler(Sampler[int]):
+    """
+    Кадры одного mp4 идут подряд (по position), порядок видео перемешивается.
+
+    Так VideoCapture не прыгает по 246 файлам и кэш каптуры работает.
+    """
+
+    def __init__(self, dataset: LIGVideoDataset, *, seed: int = 42) -> None:
+        groups: dict[str, list[int]] = {}
+        for idx, sample in enumerate(dataset.samples):
+            key = str(sample["video_path"])
+            groups.setdefault(key, []).append(idx)
+        for idxs in groups.values():
+            idxs.sort(key=lambda i: float(dataset.samples[i]["position"]))
+        self._groups = list(groups.values())
+        self._seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self._seed + self._epoch)
+        order = list(self._groups)
+        rng.shuffle(order)
+        self._epoch += 1
+        for group in order:
+            yield from group
+
+    def __len__(self) -> int:
+        return sum(len(group) for group in self._groups)
+
+
 def extract_frames(batch) -> torch.Tensor:
     if torch.is_tensor(batch):
         frames = batch
@@ -249,6 +280,7 @@ def train_one_epoch(
     target_squared_sum = 0.0
 
     total_elements = 0
+    n_batches = len(dataloader)
     for batch_index, batch in enumerate(dataloader):
         clean_frames = extract_frames(batch)
         clean_frames = clean_frames.float()
@@ -277,6 +309,12 @@ def train_one_epoch(
             )
         loss.backward()
         optimizer.step()
+
+        if batch_index == 0 or (batch_index + 1) % 50 == 0 or (batch_index + 1) == n_batches:
+            print(
+                f"  batch {batch_index + 1}/{n_batches}  loss={loss.item():.6f}",
+                flush=True,
+            )
 
 
         # Метрики
@@ -365,18 +403,19 @@ def main() -> None:
     validate_args(args)
     set_random_seed(args.seed)
     device = get_device()
-    print("=" * 60)
-    print("CDAE TRAINING")
-    print("=" * 60)
-    print(f"Device:       {device}")
-    print(f"Metadata:     {args.metadata}")
-    print(f"Video dir:    {args.video_dir}")
-    print(f"Pos. step:    {args.position_step}")
-    print(f"Epochs:       {args.epochs}")
-    print(f"Batch size:   {args.batch_size}")
-    print(f"Learning rate:{args.learning_rate}")
-    print(f"Noise std:    {args.noise_std}")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("CDAE TRAINING", flush=True)
+    print("=" * 60, flush=True)
+    print(f"Device:       {device}", flush=True)
+    print(f"Metadata:     {args.metadata}", flush=True)
+    print(f"Video dir:    {args.video_dir}", flush=True)
+    print(f"Pos. step:    {args.position_step}", flush=True)
+    print(f"Epochs:       {args.epochs}", flush=True)
+    print(f"Batch size:   {args.batch_size}", flush=True)
+    print(f"Learning rate:{args.learning_rate}", flush=True)
+    print(f"Noise std:    {args.noise_std}", flush=True)
+    print("=" * 60, flush=True)
+    print("Indexing videos (open each mp4 once)...", flush=True)
 
     dataset = build_dataset(
         metadata_path=args.metadata,
@@ -390,12 +429,13 @@ def main() -> None:
     extra = ""
     if n_videos is not None:
         extra = f"  videos={n_videos}  skipped={n_skipped}"
-    print(f"Dataset samples: {len(dataset)}{extra}")
+    print(f"Dataset samples: {len(dataset)}{extra}", flush=True)
 
+    sampler = VideoGroupedSampler(dataset, seed=args.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -420,7 +460,8 @@ def main() -> None:
             f"Epoch {epoch:03d}/{args.epochs:03d} "
             f"| MSE: {mse:.6f} "
             f"| MAE: {mae:.6f} "
-            f"| R²: {r2:.6f}"
+            f"| R²: {r2:.6f}",
+            flush=True,
         )
 
         save_model_weights(
