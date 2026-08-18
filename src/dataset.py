@@ -334,6 +334,141 @@ class LIGVideoDataset(Dataset):
         }
 
 
+class LIGTemporalDataset(LIGVideoDataset):
+    """
+    Temporal Dataset для Transformer-модели.
+
+    Один элемент Dataset = окно последних ``window_size`` кадров одного MP4,
+    заканчивающееся на текущей относительной позиции.
+
+    Возвращает:
+        frames:       Tensor [T, 3, H, W], float32, значения [0, 1]
+        frame_mask:   Tensor [T], bool; True = реальный кадр, False = padding слева
+        laser_params: Tensor [3]
+        position:     Tensor [1] — позиция последнего (текущего) кадра
+        target:       Tensor [1]
+
+    Сетка позиций остаётся той же, что и у LIGVideoDataset:
+        position_step=0.02 -> 0.02, 0.04, ..., 0.98.
+
+    При нехватке истории слева добавляются НУЛЕВЫЕ временные кадры. Они не
+    являются частью изображения и должны игнорироваться Transformer-моделью
+    по frame_mask.
+    """
+
+    def __init__(
+        self,
+        metadata_path,
+        video_root,
+        frame_size=(128, 128),
+        position_step=0.02,
+        window_size=20,
+    ):
+        if not isinstance(window_size, int) or isinstance(window_size, bool):
+            raise TypeError("window_size должен быть целым числом.")
+        if window_size <= 0:
+            raise ValueError("window_size должен быть больше нуля.")
+
+        self.window_size = window_size
+
+        # Вся логика CSV, поиска MP4, samples и проверок остаётся общей
+        # с покадровым LIGVideoDataset.
+        super().__init__(
+            metadata_path=metadata_path,
+            video_root=video_root,
+            frame_size=frame_size,
+            position_step=position_step,
+        )
+
+        self._position_grid = self.processor.get_position_grid()
+
+        if self.window_size > len(self._position_grid):
+            print(
+                f"[INFO] window_size={self.window_size} больше числа позиций "
+                f"({len(self._position_grid)}). Начальные окна будут содержать "
+                "больше padding, но Dataset остаётся корректным."
+            )
+
+    def _position_index(self, position):
+        """Найти индекс текущей позиции в общей сетке 0.02, 0.04, ..."""
+        matches = np.flatnonzero(
+            np.isclose(
+                self._position_grid,
+                float(position),
+                rtol=0.0,
+                atol=max(1e-7, self.processor.position_step * 1e-5),
+            )
+        )
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Позиция {position} не найдена однозначно в сетке позиций."
+            )
+
+        return int(matches[0])
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        current_idx = self._position_index(sample["position"])
+
+        # Берём только прошлое и текущий кадр. В будущее не смотрим.
+        start_idx = max(0, current_idx - self.window_size + 1)
+        live_positions = self._position_grid[start_idx:current_idx + 1]
+        live_count = len(live_positions)
+        pad_count = self.window_size - live_count
+
+        live_frames = [
+            self.processor.get_frame(sample["video_path"], float(position))
+            for position in live_positions
+        ]
+
+        # Хотя live_count всегда >= 1 (текущая позиция существует), оставляем
+        # явную защиту от некорректной сетки.
+        if not live_frames:
+            raise RuntimeError(
+                f"Не удалось сформировать temporal-окно для позиции "
+                f"{sample['position']}"
+            )
+
+        # Все реальные кадры уже имеют форму [3, H, W].
+        live_tensor = torch.stack(live_frames, dim=0)
+
+        if pad_count > 0:
+            padding = torch.zeros(
+                (pad_count, *live_tensor.shape[1:]),
+                dtype=live_tensor.dtype,
+            )
+            frames = torch.cat([padding, live_tensor], dim=0)
+        else:
+            frames = live_tensor
+
+        frame_mask = torch.zeros(self.window_size, dtype=torch.bool)
+        frame_mask[pad_count:] = True
+
+        laser_values = np.array(
+            [sample["power"], sample["speed"], sample["distance"]],
+            dtype=np.float32,
+        )
+
+        if self.laser_mean is not None and self.laser_std is not None:
+            laser_values = (laser_values - self.laser_mean) / self.laser_std
+
+        laser_params = torch.tensor(laser_values, dtype=torch.float32)
+        position = torch.tensor([sample["position"]], dtype=torch.float32)
+        target = torch.tensor([sample["target"]], dtype=torch.float32)
+
+        return {
+            "frames": frames,
+            "frame_mask": frame_mask,
+            "laser_params": laser_params,
+            "target": target,
+            "position": position,
+            "video_id": sample["video_id"],
+            "sample_name": sample["sample_name"],
+            "video_path": str(sample["video_path"]),
+        }
+
+
 def _unique_video_records(dataset):
     """Взять по одной записи на каждое уникальное MP4."""
     records = {}
@@ -613,6 +748,70 @@ def build_datasets_and_loaders(
         video_root=video_root,
         frame_size=frame_size,
         position_step=position_step,
+    )
+
+    train_dataset, val_dataset, test_dataset, split_info = split_dataset_by_video(
+        dataset=dataset,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+        normalize_laser_params=normalize_laser_params,
+    )
+
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        test_dataset=test_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        seed=seed,
+    )
+
+    return (
+        dataset,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        train_loader,
+        val_loader,
+        test_loader,
+        split_info,
+    )
+
+
+def build_temporal_datasets_and_loaders(
+    metadata_path,
+    video_root,
+    frame_size=(128, 128),
+    position_step=0.02,
+    window_size=20,
+    train_ratio=0.70,
+    val_ratio=0.15,
+    test_ratio=0.15,
+    batch_size=8,
+    num_workers=0,
+    seed=42,
+    normalize_laser_params=True,
+):
+    """
+    Полный pipeline для Transformer/temporal-модели.
+
+    Старую build_datasets_and_loaders() не заменяет и не меняет:
+    она по-прежнему создаёт покадровый LIGVideoDataset.
+
+    Возвращает:
+        dataset,
+        train_dataset, val_dataset, test_dataset,
+        train_loader, val_loader, test_loader,
+        split_info
+    """
+    dataset = LIGTemporalDataset(
+        metadata_path=metadata_path,
+        video_root=video_root,
+        frame_size=frame_size,
+        position_step=position_step,
+        window_size=window_size,
     )
 
     train_dataset, val_dataset, test_dataset, split_info = split_dataset_by_video(
