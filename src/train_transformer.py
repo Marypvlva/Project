@@ -64,14 +64,21 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.
         )
 
     frames = batch["frames"].to(device)
-    if "params" in batch:
+    if "laser_params" in batch:
+        params = batch["laser_params"].to(device)
+    elif "params" in batch:
         params = batch["params"].to(device)
     elif "process_params" in batch:
         params = batch["process_params"].to(device)
     else:
-        raise KeyError("В батче нет 'params' / 'process_params'")
+        raise KeyError("В батче нет 'laser_params' / 'params' / 'process_params'")
 
-    time = batch["time"].to(device)
+    if "position" in batch:
+        time = batch["position"].to(device)
+    elif "time" in batch:
+        time = batch["time"].to(device)
+    else:
+        raise KeyError("В батче нет 'position' / 'time'")
     target = batch["target"].to(device).float()
     target = torch.nan_to_num(
         target,
@@ -226,10 +233,13 @@ def _build_dataset(
 ) -> Dataset:
     kwargs: dict[str, Any] = {
         "metadata_path": metadata_path,
-        "video_dir": video_dir,
     }
     sig = inspect.signature(dataset_cls.__init__)
     params = sig.parameters
+    if "video_root" in params:
+        kwargs["video_root"] = video_dir
+    elif "video_dir" in params:
+        kwargs["video_dir"] = video_dir
     if "window_size" in params:
         kwargs["window_size"] = window_size
     if "temporal" in params:

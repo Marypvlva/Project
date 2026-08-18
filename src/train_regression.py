@@ -1,12 +1,11 @@
 """
 Обучение регрессора сопротивления поверх предобученного CDAE.
 
-Ожидаемые ключи батча (от #2 / как в train_cdae):
-  frame                         — [B, 3, H, W], float [0, 1]
-  params / process_params       — [B, 3], стандартизованные
-  time                          — [B, 1], elapsed/duration в [0, 1]
-  target                        — [B, 1], сопротивление в кОм
-
+Ключи батча от LIGVideoDataset:
+  frame                         — [B, 3, 128, 128], float [0, 1]
+  laser_params / params         — [B, 3] power, speed, distance
+  position / time               — [B, 1] относительная позиция в видео [0, 1]
+  target                        — [B, 1] сопротивление в кОм
 
 Метрики: logs/regression_metrics.csv + консоль. Best по val MAE.
 """
@@ -15,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 from pathlib import Path
 from typing import Any, Optional
 
@@ -50,19 +50,27 @@ METRICS_FIELDS = [
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    """frame/params/time/target; params совместим с process_params из train_cdae."""
+    """frame + laser_params/params + position/time + target."""
     if not isinstance(batch, dict):
         raise TypeError(f"Ожидался dict-батч, получено {type(batch).__name__}")
 
     frame = batch["frame"].to(device)
-    if "params" in batch:
+    if "laser_params" in batch:
+        params = batch["laser_params"].to(device)
+    elif "params" in batch:
         params = batch["params"].to(device)
     elif "process_params" in batch:
         params = batch["process_params"].to(device)
     else:
-        raise KeyError("В батче нет 'params' / 'process_params'")
+        raise KeyError("В батче нет 'laser_params' / 'params' / 'process_params'")
 
-    time = batch["time"].to(device)
+    if "position" in batch:
+        time = batch["position"].to(device)
+    elif "time" in batch:
+        time = batch["time"].to(device)
+    else:
+        raise KeyError("В батче нет 'position' / 'time'")
+
     target = batch["target"].to(device)
     if target.ndim == 1:
         target = target.unsqueeze(1)
@@ -164,21 +172,39 @@ def _format_epoch_line(row: dict[str, Any]) -> str:
 
 
 def _load_dataset_class():
-    """Как в train_cdae: LIGDataset; запасной вариант LIGVideoDataset."""
-    try:
-        from dataset import LIGDataset
-
-        return LIGDataset
-    except ImportError:
-        pass
+    """LIGVideoDataset коллеги; запасной алиас LIGDataset."""
     try:
         from dataset import LIGVideoDataset
 
         return LIGVideoDataset
+    except ImportError:
+        pass
+    try:
+        from dataset import LIGDataset
+
+        return LIGDataset
     except ImportError as exc:
         raise SystemExit(
-            "Не найден dataset.LIGDataset / LIGVideoDataset — нужен код от #2."
+            "Не найден dataset.LIGVideoDataset / LIGDataset."
         ) from exc
+
+
+def _make_dataset(
+    dataset_cls: type,
+    metadata_path: Path,
+    video_dir: Path,
+) -> Dataset:
+    kwargs: dict[str, Any] = {"metadata_path": metadata_path}
+    params = inspect.signature(dataset_cls.__init__).parameters
+    if "video_root" in params:
+        kwargs["video_root"] = video_dir
+    elif "video_dir" in params:
+        kwargs["video_dir"] = video_dir
+    else:
+        raise TypeError(
+            f"{dataset_cls.__name__} не принимает video_root / video_dir"
+        )
+    return dataset_cls(**kwargs)
 
 
 def train_regression(
@@ -298,9 +324,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--cdae-ckpt", type=Path, default=DEFAULT_CDAE_CKPT)
     p.add_argument("--out-ckpt", type=Path, default=DEFAULT_OUT_CKPT)
     p.add_argument("--metrics-csv", type=Path, default=DEFAULT_METRICS_CSV)
-    p.add_argument("--metadata", type=Path, default=PROJECT_ROOT / "data" / "metadata_train.csv")
-    p.add_argument("--val-metadata", type=Path, default=PROJECT_ROOT / "data" / "metadata_val.csv")
-    p.add_argument("--video-dir", type=Path, default=PROJECT_ROOT / "data" / "raw_videos")
+    p.add_argument("--metadata", type=Path, default=PROJECT_ROOT / "data2" / "table.xlsx")
+    p.add_argument("--val-metadata", type=Path, default=PROJECT_ROOT / "data2" / "table_val.xlsx")
+    p.add_argument("--video-dir", type=Path, default=PROJECT_ROOT / "data2")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -329,11 +355,13 @@ def main() -> None:
     if not Path(args.val_metadata).exists():
         raise SystemExit(f"нет val metadata: {args.val_metadata}")
 
-    train_dataset: Dataset = dataset_cls(
+    train_dataset: Dataset = _make_dataset(
+        dataset_cls,
         metadata_path=args.metadata,
         video_dir=args.video_dir,
     )
-    val_dataset: Dataset = dataset_cls(
+    val_dataset: Dataset = _make_dataset(
+        dataset_cls,
         metadata_path=args.val_metadata,
         video_dir=args.video_dir,
     )
