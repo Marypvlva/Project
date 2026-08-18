@@ -144,25 +144,65 @@ class VideoProcessor:
 
     def preprocess_frame(self, frame):
         """
-        BGR uint8 [H,W,3] -> RGB -> resize -> float32 [0,1] -> CHW Tensor.
+        BGR uint8 [H,W,3]
+        -> если высота больше 720, обрезаем сверху и снизу до 720
+        -> resize до 128x128
+        -> RGB
+        -> float32 [0,1]
+        -> CHW Tensor
         """
+
         if frame is None:
             raise ValueError("Получен пустой кадр.")
+
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError(
                 f"Ожидался цветной кадр [H, W, 3], получено: {frame.shape}"
             )
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = frame.shape[:2]
+
+        # Приводим все высокие видео к высоте 720.
+        # Ширину не трогаем.
+        crop_height = 720
+
+        if height > crop_height:
+            extra_height = height - crop_height
+
+            # Обрезаем поровну сверху и снизу
+            y_start = extra_height // 2
+            y_end = y_start + crop_height
+
+            frame = frame[y_start:y_end, :]
+
+        # Теперь, например:
+        # 1280x1024 -> 1280x720
+        # 1280x720  -> остается 1280x720
+
+        # Resize до размера для нейросети
         frame = cv2.resize(
             frame,
             self.frame_size,
-            interpolation=cv2.INTER_AREA,
+            interpolation=cv2.INTER_AREA
         )
+
+        # BGR -> RGB
+        frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
+
+        # 0..255 -> 0..1
         frame = frame.astype(np.float32) / 255.0
         frame = np.clip(frame, 0.0, 1.0)
 
-        frame = torch.from_numpy(frame).permute(2, 0, 1).contiguous()
+        # [H,W,C] -> [C,H,W]
+        frame = (
+            torch.from_numpy(frame)
+                .permute(2, 0, 1)
+                .contiguous()
+        )
+
         return frame.float()
 
     def get_frame(self, video_path, position):
