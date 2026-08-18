@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
+_SRC_DIR = Path(__file__).resolve().parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from cdae_model import CDAE
 from dataset import LIGVideoDataset
@@ -30,14 +35,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metadata",
         type=Path,
-        required=True,
-        help="Path to table.xlsx (листы Sample N).",
+        default=PROJECT_ROOT / "data" / "metadata.csv",
+        help="CSV с колонками sample, video_id, filename, power_mW, speed_mm_s, "
+        "distance_um, resistance_kOhm_sq.",
     )
     parser.add_argument(
         "--video-dir",
         type=Path,
-        required=True,
-        help="Корень с папками Sample 1, Sample 2, ... (video_root датасета).",
+        default=PROJECT_ROOT / "file_store" / "dataset",
+        help="Корень с папками Sample 1, Sample 2, ... (video_root). "
+        "В DataSphere: file_store/dataset",
     )
     parser.add_argument(
         "--position-step",

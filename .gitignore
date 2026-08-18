@@ -15,9 +15,8 @@ __pycache__/
 
 # Данные
 data/*
-
-# Но оставляем саму папку data
 !data/.gitkeep
+!data/metadata.csv
 
 # Веса моделей
 checkpoints/*
