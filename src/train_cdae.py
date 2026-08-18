@@ -1,25 +1,103 @@
 """
 Обучение CDAE.
 
-Здесь только: batch["frame"] [B, 3, 128, 128] в [0, 1] → шум → CDAE → MSE.
+Пайплайн: видео из metadata → кадры через read_mp4_frame 
+→ batch["frame"] [B, 3, 128, 128] в [0, 1] → шум → CDAE → MSE.
+
+Внутренняя разбивка mp4 (сетка времени, seek, resize) — в video_processor,
+здесь только вызов.
 """
 from __future__ import annotations
 
 import argparse
 import random
 from pathlib import Path
+from typing import Sequence
 
+import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from dataset import LIGDataset
 from cdae_model import CDAE
+from video_processor import read_mp4_frame
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 IMAGE_SIZE = 128
+_VIDEO_COLS = ("video_id", "video", "filename", "file", "name")
+
+
+def _pick_col(df: pd.DataFrame, names: tuple[str, ...]) -> str:
+    lower = {c.lower(): c for c in df.columns}
+    for name in names:
+        if name.lower() in lower:
+            return lower[name.lower()]
+    raise KeyError(f"No video column in metadata. Have: {list(df.columns)}")
+
+
+def _resolve_video_path(video_dir: Path, video_id) -> Path | None:
+    raw = str(video_id).strip()
+    candidates = [video_dir / raw]
+    p = Path(raw)
+    if p.is_absolute():
+        candidates.insert(0, p)
+    if not raw.lower().endswith(".mp4"):
+        candidates.append(video_dir / f"{raw}.mp4")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _time_grid_for_video(video_path: Path) -> Sequence[float]:
+    """Сетка времени — метод коллеги, не реализуем сами."""
+    import video_processor as vp
+
+    if hasattr(vp, "get_time_grid"):
+        try:
+            return list(vp.get_time_grid(video_path))
+        except TypeError:
+            info = vp.get_video_info(video_path)
+            duration = info["duration"] if isinstance(info, dict) else info
+            return list(vp.get_time_grid(duration))
+
+    processor = vp.VideoProcessor()
+    info = processor.get_video_info(video_path)
+    duration = info["duration"] if isinstance(info, dict) else info
+    return list(processor.get_time_grid(duration))
+
+
+class CDAEFrameDataset(Dataset):
+    """Видео из CSV; кадр в __getitem__ через read_mp4_frame коллеги."""
+
+    def __init__(self, metadata_path: Path, video_dir: Path) -> None:
+        path = Path(metadata_path)
+        df = (
+            pd.read_excel(path)
+            if path.suffix.lower() in {".xlsx", ".xls"}
+            else pd.read_csv(path)
+        )
+        video_col = _pick_col(df, _VIDEO_COLS)
+        self.samples: list[tuple[Path, float]] = []
+        skipped = 0
+        for _, row in df.iterrows():
+            video_path = _resolve_video_path(Path(video_dir), row[video_col])
+            if video_path is None:
+                skipped += 1
+                continue
+            for t in _time_grid_for_video(video_path):
+                self.samples.append((video_path, float(t)))
+        if skipped:
+            print(f"Skipped videos without file: {skipped}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        video_path, time_sec = self.samples[idx]
+        return {"frame": read_mp4_frame(video_path, time_sec)}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -127,8 +205,8 @@ def get_device() -> torch.device:
 def build_dataset(
     metadata_path: Path,
     video_dir: Path,
-) -> LIGDataset:
-    return LIGDataset(
+) -> CDAEFrameDataset:
+    return CDAEFrameDataset(
         metadata_path=metadata_path,
         video_dir=video_dir,
     )
@@ -363,7 +441,7 @@ def main() -> None:
     )
     if len(dataset) == 0:
         raise RuntimeError(
-            "LIGDataset contains zero samples."
+            "No frames: empty metadata or read_mp4_frame/get_time_grid returned nothing."
         )
     print(f"Dataset samples: {len(dataset)}")
 
