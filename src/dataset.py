@@ -34,7 +34,7 @@ class LIGVideoDataset(Dataset):
         self.video_root = Path(video_root)
 
         if not self.metadata_path.exists():
-            raise FileNotFoundError(f"Excel-файл не найден: {self.metadata_path}")
+            raise FileNotFoundError(f"CSV-файл не найден: {self.metadata_path}")
         if not self.video_root.exists():
             raise FileNotFoundError(f"Папка с видео не найдена: {self.video_root}")
 
@@ -43,32 +43,38 @@ class LIGVideoDataset(Dataset):
             position_step=position_step,
         )
 
-        # Названия колонок в Excel.
-        self.video_id_column = "Название видео"
-        self.target_column = "Сопротивление ДО ультразвуковой обработки, кОм"
-        self.power_column = "Мощность, mW"
-        self.speed_column = "Скорость обработки лазером образцов, мм/мин"
-        self.distance_column = "Расстояние между линиями, мкм"
+        # Названия колонок в новом metadata.csv.
+        self.sample_column = "sample"
+        self.video_id_column = "video_id"
+        self.filename_column = "filename"
+        self.target_column = "resistance_kOhm_sq"
+        self.power_column = "power_mW"
+        self.speed_column = "speed_mm_s"
+        self.distance_column = "distance_um"
+
+        # Дополнительные поля CSV (не подаются в модель, но сохраняются для контроля).
+        self.replicate_column = "replicate"
+        self.csv_fps_column = "fps"
+        self.resolution_column = "resolution"
 
         # Параметры нормализации задаются ТОЛЬКО после train/val/test split.
-        # До этого Dataset возвращает исходные числовые параметры.
         self.laser_mean = None
         self.laser_std = None
 
-        self.excel_file = pd.ExcelFile(self.metadata_path)
-        self.metadata = {}
+        self.metadata = pd.read_csv(self.metadata_path)
+        self.metadata = self.metadata.dropna(how="all").copy()
+        self._check_columns(self.metadata)
 
-        for sheet_name in self.excel_file.sheet_names:
-            if not sheet_name.lower().startswith("sample"):
-                continue
-
-            df = pd.read_excel(self.metadata_path, sheet_name=sheet_name)
-            df = df.dropna(how="all")
-            self._check_columns(df, sheet_name)
-            self.metadata[sheet_name] = df
-
-        if not self.metadata:
-            raise ValueError("В Excel не найдено ни одного листа Sample.")
+        # Приводим ключевые строковые поля к единому виду.
+        self.metadata[self.sample_column] = (
+            self.metadata[self.sample_column].astype(str).str.strip()
+        )
+        self.metadata[self.video_id_column] = (
+            self.metadata[self.video_id_column].astype(str).str.strip()
+        )
+        self.metadata[self.filename_column] = (
+            self.metadata[self.filename_column].astype(str).str.strip()
+        )
 
         self.samples = []
         self.video_count = 0
@@ -81,10 +87,12 @@ class LIGVideoDataset(Dataset):
                 "Dataset пуст. Не удалось сформировать ни одного sample."
             )
 
-    def _check_columns(self, df, sheet_name):
-        """Проверить наличие всех обязательных столбцов."""
+    def _check_columns(self, df):
+        """Проверить наличие обязательных столбцов нового CSV."""
         required_columns = [
+            self.sample_column,
             self.video_id_column,
+            self.filename_column,
             self.target_column,
             self.power_column,
             self.speed_column,
@@ -93,8 +101,18 @@ class LIGVideoDataset(Dataset):
 
         missing = [column for column in required_columns if column not in df.columns]
         if missing:
+            raise ValueError(f"В CSV отсутствуют столбцы: {missing}")
+
+        duplicate_keys = df.duplicated(
+            subset=[self.sample_column, self.filename_column], keep=False
+        )
+        if duplicate_keys.any():
+            duplicates = df.loc[
+                duplicate_keys, [self.sample_column, self.filename_column]
+            ].to_dict("records")
             raise ValueError(
-                f"На листе '{sheet_name}' отсутствуют столбцы: {missing}"
+                "В CSV есть повторяющиеся пары sample + filename: "
+                f"{duplicates[:10]}"
             )
 
     @staticmethod
@@ -105,21 +123,25 @@ class LIGVideoDataset(Dataset):
             raise ValueError(f"Не удалось определить video_id из имени: {filename}")
         return "S" + match.group(1)
 
-    def _find_metadata_row(self, sample_name, video_id):
-        """Найти единственную строку Excel для конкретного видео."""
-        if sample_name not in self.metadata:
-            raise ValueError(f"В Excel отсутствует лист '{sample_name}'")
-
-        df = self.metadata[sample_name]
-        rows = df[
-            df[self.video_id_column].astype(str).str.strip() == video_id
-        ]
+    def _find_metadata_row(self, sample_name, video_path):
+        """Найти единственную строку CSV по папке Sample и точному имени MP4."""
+        sample_mask = (
+            self.metadata[self.sample_column].str.casefold()
+            == str(sample_name).strip().casefold()
+        )
+        filename_mask = (
+            self.metadata[self.filename_column].str.casefold()
+            == video_path.name.strip().casefold()
+        )
+        rows = self.metadata[sample_mask & filename_mask]
 
         if len(rows) == 0:
-            raise ValueError(f"{video_id} не найден на листе '{sample_name}'")
+            raise ValueError(
+                f"Файл '{video_path.name}' из папки '{sample_name}' не найден в CSV"
+            )
         if len(rows) > 1:
             raise ValueError(
-                f"Для {video_id} на листе '{sample_name}' найдено несколько строк."
+                f"Для '{sample_name}/{video_path.name}' найдено несколько строк CSV."
             )
 
         return rows.iloc[0]
@@ -159,7 +181,7 @@ class LIGVideoDataset(Dataset):
         )
 
     def _build_samples(self):
-        """Связать MP4 с Excel и сформировать примеры по позициям видео."""
+        """Связать MP4 с CSV и сформировать примеры по позициям видео."""
         sample_dirs = sorted(
             path
             for path in self.video_root.iterdir()
@@ -174,10 +196,14 @@ class LIGVideoDataset(Dataset):
         for sample_dir in sample_dirs:
             sample_name = sample_dir.name
 
-            if sample_name not in self.metadata:
+            sample_exists = (
+                self.metadata[self.sample_column].str.casefold()
+                == sample_name.strip().casefold()
+            ).any()
+            if not sample_exists:
                 print(
                     f"[SKIP FOLDER] '{sample_name}': "
-                    "нет соответствующего листа Excel."
+                    "нет соответствующих строк в CSV."
                 )
                 continue
 
@@ -191,7 +217,12 @@ class LIGVideoDataset(Dataset):
 
                 try:
                     video_id = self._extract_video_id(video_path.name)
-                    row = self._find_metadata_row(sample_name, video_id)
+                    row = self._find_metadata_row(sample_name, video_path)
+                    csv_video_id = str(row[self.video_id_column]).strip()
+                    if csv_video_id != video_id:
+                        raise ValueError(
+                            f"video_id в имени ({video_id}) не совпадает с CSV ({csv_video_id})"
+                        )
 
                     target = self._to_valid_float(row[self.target_column])
                     power = self._to_valid_float(row[self.power_column])
@@ -231,6 +262,9 @@ class LIGVideoDataset(Dataset):
                                 "speed": speed,
                                 "distance": distance,
                                 "target": target,
+                                "replicate": row.get(self.replicate_column, None),
+                                "csv_fps": row.get(self.csv_fps_column, None),
+                                "resolution": row.get(self.resolution_column, None),
                                 "fps": video_info["fps"],
                                 "total_frames": video_info["total_frames"],
                                 "duration": video_info["duration"],
