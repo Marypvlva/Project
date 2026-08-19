@@ -69,6 +69,18 @@ def one_sided_censored_abs_error(
     return err
 
 
+def position_label_weights(position: torch.Tensor, gamma: float) -> torch.Tensor:
+    """
+    Вес сэмпла, когда известна только финальная метка R.
+
+    weight = position ** gamma. gamma=0 → равномерно; gamma=2 → ранние
+    кадры почти не учат, конец ролика доминирует.
+    """
+    if gamma <= 0:
+        return torch.ones_like(position)
+    return position.clamp_min(1e-6).pow(gamma)
+
+
 class OneSidedCensoredMSELoss(nn.Module):
     """Средний one-sided censored MSE по батчу."""
 
@@ -81,6 +93,7 @@ class OneSidedCensoredMSELoss(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         censored: torch.Tensor,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         err = one_sided_censored_squared_error(
             pred,
@@ -88,4 +101,7 @@ class OneSidedCensoredMSELoss(nn.Module):
             censored,
             censor_threshold=self.censor_threshold,
         )
-        return err.mean()
+        if weight is None:
+            return err.mean()
+        w = weight if weight.ndim == err.ndim else weight.view_as(err)
+        return (err * w).sum() / w.sum().clamp_min(1e-8)

@@ -172,7 +172,7 @@ class ResistanceRegressor(nn.Module):
         Аргументы:
             frame:    [B, 3, H, W] в [0, 1]
             params:   [B, 3] z-scored [power, speed, distance_um]
-            position: [B, 1] нормированная позиция в видео [0, 1] (не секунды).
+            position: [B, 1] z-scored scan_mm (пройденный путь лазера, не доля видео).
                       Обязателен при use_position=True; иначе игнорируется.
         """
         img_emb = self.encode_frame(frame)

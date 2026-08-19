@@ -32,7 +32,8 @@ class TemporalResistanceRegressor(nn.Module):
 
     frames:      [B, T, 3, H, W]  последние T кадров, последний = текущий
     params:      [B, 3]             z-scored [power, speed, distance_um]
-    position:    [B, 1]             нормированная позиция последнего кадра в [0, 1]
+    position:    [B, 1]             z-scored scan_mm текущего кадра
+    frame_elapsed_s: [B, T]         z-scored elapsed_s каждого кадра окна
     frame_mask:  [B, T] bool, True = реальный кадр; False = padding в начале видео
     """
 
@@ -78,6 +79,8 @@ class TemporalResistanceRegressor(nn.Module):
 
         self.pos_embed = nn.Parameter(torch.zeros(1, window_size, d_model))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # Физическое время кадра (elapsed_s), не индекс слота в окне.
+        self.time_proj = nn.Linear(1, d_model, bias=False)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -121,6 +124,7 @@ class TemporalResistanceRegressor(nn.Module):
         params: torch.Tensor,
         position: Optional[torch.Tensor] = None,
         frame_mask: Optional[torch.Tensor] = None,
+        frame_elapsed_s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if frames.ndim != 5:
             raise ValueError(f"frames must be [B, T, 3, H, W], got {tuple(frames.shape)}")
@@ -134,6 +138,12 @@ class TemporalResistanceRegressor(nn.Module):
 
         tokens = self.token_proj(self.encode_frames(frames))
         tokens = tokens + self.pos_embed[:, :t, :]
+        if frame_elapsed_s is not None:
+            if frame_elapsed_s.shape != (b, t):
+                raise ValueError(
+                    f"frame_elapsed_s must be [B, T], got {tuple(frame_elapsed_s.shape)}"
+                )
+            tokens = tokens + self.time_proj(frame_elapsed_s.unsqueeze(-1))
 
         if frame_mask is not None:
             if frame_mask.shape != (b, t):
@@ -143,12 +153,8 @@ class TemporalResistanceRegressor(nn.Module):
             key_padding = None
 
         temporal = self.transformer(tokens, src_key_padding_mask=key_padding)
-        if frame_mask is not None:
-            valid = frame_mask.float().unsqueeze(-1)
-            denom = valid.sum(dim=1).clamp_min(1.0)
-            pooled = (temporal * valid).sum(dim=1) / denom
-        else:
-            pooled = temporal[:, -1, :]
+        # Левый padding: последний слот всегда текущий кадр.
+        pooled = temporal[:, -1, :]
 
         if self.use_position:
             if position is None:

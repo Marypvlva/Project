@@ -8,7 +8,9 @@
   frames                        — [B, T, 3, 128, 128]; последний = текущий
   frame_mask                    — [B, T] bool; False = padding слева
   laser_params                  — [B, 3] z-scored
-  position                      — [B, 1] прогресс последнего кадра
+  position                      — [B, 1] доля видео [0, 1]; вес лосса
+  scan_mm                       — [B, 1] z-scored проход лазера, вход головы
+  frame_elapsed_s               — [B, T] z-scored секунды каждого кадра окна
   target                        — [B, 1] R в кОм
   target_censored               — [B, 1] bool; True если R >= 86 («-» в Excel)
 
@@ -37,10 +39,11 @@ from censored_loss import (
     OneSidedCensoredMSELoss,
     one_sided_censored_abs_error,
     one_sided_censored_squared_error,
+    position_label_weights,
 )
 from cdae_model import load_cdae
 from dataset import LIGTemporalDataset, split_dataset_by_video
-from train_regression import VideoGroupedSubsetSampler, _to_float_list
+from train_regression import VideoGroupedSubsetSampler, _to_float_list, build_adamw
 from transformer_model import (
     DEFAULT_WINDOW_SIZE,
     TemporalResistanceRegressor,
@@ -111,15 +114,25 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.
     if position.ndim == 1:
         position = position.unsqueeze(1)
 
+    if "scan_mm" in batch:
+        progress = batch["scan_mm"].to(device)
+    else:
+        progress = position
+    if progress.ndim == 1:
+        progress = progress.unsqueeze(1)
+
     out: dict[str, torch.Tensor] = {
         "frames": frames,
         "params": params,
         "position": position,
+        "progress": progress,
         "target": target,
         "target_censored": target_censored,
     }
     if "frame_mask" in batch:
         out["frame_mask"] = batch["frame_mask"].to(device)
+    if "frame_elapsed_s" in batch:
+        out["frame_elapsed_s"] = batch["frame_elapsed_s"].to(device)
     return out
 
 
@@ -154,13 +167,14 @@ def evaluate(
     device: torch.device,
     *,
     censor_threshold: float = MAX_RESISTANCE_KOHM,
+    label_weight_gamma: float = 0.0,
 ) -> dict[str, float]:
     """One-sided censored MSE + MAE; MSE/R² — только на нецензурированных."""
     was_training = model.training
     encoder_was_training = model.encoder.training
     model.eval()
 
-    abs_err = sq_err = sum_y = sum_y2 = censored_mse_sum = 0.0
+    abs_err = sq_err = sum_y = sum_y2 = censored_mse_sum = weight_sum = 0.0
     n_uncensored = 0
     n_all = 0
 
@@ -169,11 +183,13 @@ def evaluate(
         pred = model(
             b["frames"],
             b["params"],
-            b["position"],
+            b["progress"],
             frame_mask=b.get("frame_mask"),
+            frame_elapsed_s=b.get("frame_elapsed_s"),
         )
         target = b["target"]
         censored = b["target_censored"]
+        weight = position_label_weights(b["position"], label_weight_gamma)
 
         sq = one_sided_censored_squared_error(
             pred, target, censored, censor_threshold=censor_threshold
@@ -181,8 +197,9 @@ def evaluate(
         ae = one_sided_censored_abs_error(
             pred, target, censored, censor_threshold=censor_threshold
         )
-        censored_mse_sum += sq.sum().item()
-        abs_err += ae.sum().item()
+        censored_mse_sum += (sq * weight).sum().item()
+        abs_err += (ae * weight).sum().item()
+        weight_sum += weight.sum().item()
         n_all += target.numel()
 
         uncensored = ~censored.bool()
@@ -197,9 +214,13 @@ def evaluate(
         model.train()
         model.encoder.train(encoder_was_training)
 
-    return _metrics_from_sums(
+    denom = weight_sum if weight_sum > 0 else float(n_all)
+    metrics = _metrics_from_sums(
         abs_err, sq_err, sum_y, sum_y2, n_uncensored, censored_mse_sum, n_all
     )
+    metrics["censored_mse"] = censored_mse_sum / denom
+    metrics["mae"] = abs_err / denom
+    return metrics
 
 
 def _set_train_modes(model: TemporalResistanceRegressor) -> None:
@@ -270,6 +291,8 @@ def train_transformer(
     device: str | torch.device = "cpu",
     unfreeze_encoder_after: Optional[int] = None,
     encoder_lr: float = 1e-5,
+    weight_decay: float = 1e-4,
+    label_weight_gamma: float = 2.0,
     extra_config: Optional[dict[str, Any]] = None,
     test_loader: Optional[DataLoader] = None,
 ) -> TemporalResistanceRegressor:
@@ -295,10 +318,7 @@ def train_transformer(
     _set_train_modes(model)
 
     criterion = OneSidedCensoredMSELoss(censor_threshold=MAX_RESISTANCE_KOHM)
-    optimizer = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr,
-    )
+    optimizer = build_adamw(model, lr=lr, weight_decay=weight_decay)
 
     best_censored_mse = float("inf")
     saved_once = False
@@ -308,22 +328,14 @@ def train_transformer(
     print(f"window_size={window_size}", flush=True)
     print(f"censor_threshold={MAX_RESISTANCE_KOHM} kOhm", flush=True)
     print(f"epochs={epochs}  device={device}", flush=True)
+    print(f"weight_decay={weight_decay}  label_weight_gamma={label_weight_gamma}", flush=True)
+    print(f"unfreeze_after={unfreeze_encoder_after}", flush=True)
 
     for epoch in range(epochs):
         if unfreeze_encoder_after is not None and epoch == unfreeze_encoder_after:
             model.unfreeze_encoder()
-            optimizer = torch.optim.Adam(
-                [
-                    {"params": list(model.encoder.parameters()), "lr": encoder_lr},
-                    {
-                        "params": [
-                            p
-                            for n, p in model.named_parameters()
-                            if p.requires_grad and not n.startswith("encoder.")
-                        ],
-                        "lr": lr,
-                    },
-                ]
+            optimizer = build_adamw(
+                model, lr=lr, weight_decay=weight_decay, encoder_lr=encoder_lr
             )
             print(f"[epoch {epoch}] encoder разморожен, lr={encoder_lr}", flush=True)
 
@@ -335,10 +347,12 @@ def train_transformer(
             pred = model(
                 b["frames"],
                 b["params"],
-                b["position"],
+                b["progress"],
                 frame_mask=b.get("frame_mask"),
+                frame_elapsed_s=b.get("frame_elapsed_s"),
             )
-            loss = criterion(pred, b["target"], b["target_censored"])
+            weight = position_label_weights(b["position"], label_weight_gamma)
+            loss = criterion(pred, b["target"], b["target_censored"], weight=weight)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -353,8 +367,12 @@ def train_transformer(
                     flush=True,
                 )
 
-        train_m = evaluate(model, train_loader, device)
-        val_m = evaluate(model, val_loader, device)
+        train_m = evaluate(
+            model, train_loader, device, label_weight_gamma=label_weight_gamma
+        )
+        val_m = evaluate(
+            model, val_loader, device, label_weight_gamma=label_weight_gamma
+        )
 
         is_best = 0
         if val_m["censored_mse"] < best_censored_mse:
@@ -391,7 +409,9 @@ def train_transformer(
         )
 
     if test_loader is not None and len(test_loader) > 0:
-        test_m = evaluate(model, test_loader, device)
+        test_m = evaluate(
+            model, test_loader, device, label_weight_gamma=label_weight_gamma
+        )
         print(
             f"test  censored_mse={test_m['censored_mse']:.4f}  "
             f"mae={test_m['mae']:.4f}  "
@@ -423,7 +443,24 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--encoder-lr", type=float, default=1e-5)
-    p.add_argument("--unfreeze-after", type=int, default=None)
+    p.add_argument(
+        "--unfreeze-after",
+        type=int,
+        default=5,
+        help="Эпоха разморозки encoder. -1 = не размораживать.",
+    )
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+        help="AdamW decay на веса Linear/Conv (не bias/norm/pos_embed).",
+    )
+    p.add_argument(
+        "--label-weight-gamma",
+        type=float,
+        default=2.0,
+        help="Вес лосса = position^gamma. 0 = равномерно, 2 = акцент на конец ролика.",
+    )
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -498,10 +535,18 @@ def main() -> None:
     extra_config = {
         "laser_mean": laser_mean,
         "laser_std": laser_std,
+        "scan_mm_mean": split_info.get("scan_mm_mean"),
+        "scan_mm_std": split_info.get("scan_mm_std"),
+        "elapsed_s_mean": split_info.get("elapsed_s_mean"),
+        "elapsed_s_std": split_info.get("elapsed_s_std"),
         "position_step": float(args.position_step),
         "split_seed": int(args.seed),
         "censor_threshold_kOhm": float(MAX_RESISTANCE_KOHM),
         "window_size": int(args.window_size),
+        "label_weight_gamma": float(args.label_weight_gamma),
+        "weight_decay": float(args.weight_decay),
+        "unfreeze_after": args.unfreeze_after,
+        "progress_feature": "scan_mm",
     }
 
     norm_path = Path(args.metrics_csv).with_name("transformer_norm.json")
@@ -546,8 +591,10 @@ def main() -> None:
         epochs=args.epochs,
         lr=args.lr,
         device=args.device,
-        unfreeze_encoder_after=args.unfreeze_after,
+        unfreeze_encoder_after=args.unfreeze_after if args.unfreeze_after >= 0 else None,
         encoder_lr=args.encoder_lr,
+        weight_decay=args.weight_decay,
+        label_weight_gamma=args.label_weight_gamma,
         extra_config=extra_config,
         test_loader=test_loader,
     )

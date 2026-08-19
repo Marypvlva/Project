@@ -18,6 +18,17 @@ except ImportError:
     from src.censored_loss import MAX_RESISTANCE_KOHM
 
 
+def sample_elapsed_s(sample, position=None):
+    """Физическое время кадра: доля видео × длительность записи, сек."""
+    pos = float(sample["position"] if position is None else position)
+    return pos * float(sample["duration"])
+
+
+def sample_scan_mm(sample, position=None):
+    """Оценка прохода лазера: elapsed_s × speed_mm_s."""
+    return sample_elapsed_s(sample, position) * float(sample["speed"])
+
+
 class LIGVideoDataset(Dataset):
     """
     Dataset для MP4-видео лазерного процесса.
@@ -69,6 +80,10 @@ class LIGVideoDataset(Dataset):
         # Параметры нормализации задаются ТОЛЬКО после train/val/test split.
         self.laser_mean = None
         self.laser_std = None
+        self.scan_mm_mean = None
+        self.scan_mm_std = None
+        self.elapsed_s_mean = None
+        self.elapsed_s_std = None
 
         self.metadata = pd.read_csv(self.metadata_path)
         self.metadata = self.metadata.dropna(how="all").copy()
@@ -348,6 +363,37 @@ class LIGVideoDataset(Dataset):
         self.laser_mean = mean
         self.laser_std = std
 
+    def set_progress_normalization(self, scan_mean, scan_std, elapsed_mean, elapsed_std):
+        """mean/std для scan_mm и elapsed_s — только по train-сэмплам."""
+        scan_mean = float(np.asarray(scan_mean, dtype=np.float32))
+        scan_std = float(np.asarray(scan_std, dtype=np.float32))
+        elapsed_mean = float(np.asarray(elapsed_mean, dtype=np.float32))
+        elapsed_std = float(np.asarray(elapsed_std, dtype=np.float32))
+        if not np.isfinite([scan_mean, scan_std, elapsed_mean, elapsed_std]).all():
+            raise ValueError("progress mean/std должны быть конечными.")
+        if scan_std <= 0 or elapsed_std <= 0:
+            raise ValueError("progress std должны быть больше нуля.")
+        self.scan_mm_mean = scan_mean
+        self.scan_mm_std = scan_std
+        self.elapsed_s_mean = elapsed_mean
+        self.elapsed_s_std = elapsed_std
+
+    def _normalize_progress(self, elapsed_s, scan_mm):
+        if self.elapsed_s_mean is not None:
+            elapsed_s = (elapsed_s - self.elapsed_s_mean) / self.elapsed_s_std
+        if self.scan_mm_mean is not None:
+            scan_mm = (scan_mm - self.scan_mm_mean) / self.scan_mm_std
+        return elapsed_s, scan_mm
+
+    def _progress_tensors(self, sample, position=None):
+        elapsed_s = sample_elapsed_s(sample, position)
+        scan_mm = sample_scan_mm(sample, position)
+        elapsed_s, scan_mm = self._normalize_progress(elapsed_s, scan_mm)
+        return (
+            torch.tensor([elapsed_s], dtype=torch.float32),
+            torch.tensor([scan_mm], dtype=torch.float32),
+        )
+
     def __len__(self):
         return len(self.samples)
 
@@ -370,6 +416,7 @@ class LIGVideoDataset(Dataset):
 
         laser_params = torch.tensor(laser_values, dtype=torch.float32)
         position = torch.tensor([sample["position"]], dtype=torch.float32)
+        elapsed_s, scan_mm = self._progress_tensors(sample)
         target = torch.tensor([sample["target"]], dtype=torch.float32)
         target_censored = torch.tensor(
             [bool(sample["target_censored"])],
@@ -382,6 +429,8 @@ class LIGVideoDataset(Dataset):
             "target": target,
             "target_censored": target_censored,
             "position": position,
+            "elapsed_s": elapsed_s,
+            "scan_mm": scan_mm,
             "video_id": sample["video_id"],
             "sample_name": sample["sample_name"],
             "video_path": str(sample["video_path"]),
@@ -399,7 +448,11 @@ class LIGTemporalDataset(LIGVideoDataset):
         frames:       Tensor [T, 3, H, W], float32, значения [0, 1]
         frame_mask:   Tensor [T], bool; True = реальный кадр, False = padding слева
         laser_params: Tensor [3]
-        position:     Tensor [1] — позиция последнего (текущего) кадра
+        position:     Tensor [1] — доля видео последнего кадра (для веса лосса)
+        elapsed_s:    Tensor [1] — z-scored физическое время текущего кадра
+        scan_mm:      Tensor [1] — z-scored проход лазера текущего кадра
+        frame_elapsed_s: Tensor [T] — z-scored секунды каждого слота окна
+        frame_scan_mm:   Tensor [T]
         target:       Tensor [1]
         target_censored: Tensor [1] bool — True если R >= 86 (в Excel было «-»)
         position_step=0.02 -> 0.02, 0.04, ..., 0.98.
@@ -508,11 +561,22 @@ class LIGTemporalDataset(LIGVideoDataset):
 
         laser_params = torch.tensor(laser_values, dtype=torch.float32)
         position = torch.tensor([sample["position"]], dtype=torch.float32)
+        elapsed_s, scan_mm = self._progress_tensors(sample)
         target = torch.tensor([sample["target"]], dtype=torch.float32)
         target_censored = torch.tensor(
             [bool(sample["target_censored"])],
             dtype=torch.bool,
         )
+
+        frame_elapsed = torch.zeros(self.window_size, dtype=torch.float32)
+        frame_scan = torch.zeros(self.window_size, dtype=torch.float32)
+        for i, pos in enumerate(live_positions):
+            raw_elapsed = sample_elapsed_s(sample, pos)
+            raw_scan = sample_scan_mm(sample, pos)
+            norm_elapsed, norm_scan = self._normalize_progress(raw_elapsed, raw_scan)
+            slot = pad_count + i
+            frame_elapsed[slot] = norm_elapsed
+            frame_scan[slot] = norm_scan
 
         return {
             "frames": frames,
@@ -521,6 +585,10 @@ class LIGTemporalDataset(LIGVideoDataset):
             "target": target,
             "target_censored": target_censored,
             "position": position,
+            "elapsed_s": elapsed_s,
+            "scan_mm": scan_mm,
+            "frame_elapsed_s": frame_elapsed,
+            "frame_scan_mm": frame_scan,
             "video_id": sample["video_id"],
             "sample_name": sample["sample_name"],
             "video_path": str(sample["video_path"]),
@@ -661,6 +729,34 @@ def split_dataset_by_video(
         std = np.where(std < 1e-8, 1.0, std).astype(np.float32)
         dataset.set_laser_normalization(mean, std)
 
+        train_elapsed = np.array(
+            [
+                sample_elapsed_s(sample)
+                for sample in dataset.samples
+                if str(Path(sample["video_path"]).resolve()) in train_videos
+            ],
+            dtype=np.float32,
+        )
+        train_scan = np.array(
+            [
+                sample_scan_mm(sample)
+                for sample in dataset.samples
+                if str(Path(sample["video_path"]).resolve()) in train_videos
+            ],
+            dtype=np.float32,
+        )
+        elapsed_mean = float(train_elapsed.mean())
+        elapsed_std = float(train_elapsed.std())
+        scan_mean = float(train_scan.mean())
+        scan_std = float(train_scan.std())
+        if elapsed_std < 1e-8:
+            elapsed_std = 1.0
+        if scan_std < 1e-8:
+            scan_std = 1.0
+        dataset.set_progress_normalization(
+            scan_mean, scan_std, elapsed_mean, elapsed_std
+        )
+
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)
     test_dataset = Subset(dataset, test_indices)
@@ -675,6 +771,10 @@ def split_dataset_by_video(
         "test_samples": len(test_dataset),
         "laser_mean": None if dataset.laser_mean is None else dataset.laser_mean.copy(),
         "laser_std": None if dataset.laser_std is None else dataset.laser_std.copy(),
+        "scan_mm_mean": dataset.scan_mm_mean,
+        "scan_mm_std": dataset.scan_mm_std,
+        "elapsed_s_mean": dataset.elapsed_s_mean,
+        "elapsed_s_std": dataset.elapsed_s_std,
     }
 
     print_split_summary(dataset, split_info)
@@ -720,6 +820,16 @@ def print_split_summary(dataset, split_info):
         print("\nНормализация параметров лазера рассчитана ТОЛЬКО по TRAIN:")
         print("  mean [power, speed, distance] =", split_info["laser_mean"])
         print("  std  [power, speed, distance] =", split_info["laser_std"])
+    if split_info.get("scan_mm_mean") is not None:
+        print("Нормализация прогресса процесса (TRAIN):")
+        print(
+            f"  scan_mm   mean={split_info['scan_mm_mean']:.4g}  "
+            f"std={split_info['scan_mm_std']:.4g}"
+        )
+        print(
+            f"  elapsed_s mean={split_info['elapsed_s_mean']:.4g}  "
+            f"std={split_info['elapsed_s_std']:.4g}"
+        )
 
     if dataset.skipped_videos:
         print("\nПРОПУЩЕННЫЕ ВИДЕО:")
