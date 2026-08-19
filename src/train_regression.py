@@ -1,17 +1,18 @@
 """
 Обучение регрессора сопротивления поверх предобученного CDAE.
 
-Данные — LIGVideoDataset + split_dataset_by_video (код коллеги, без правок):
-  один CSV, деление ПО ЦЕЛЫМ ВИДЕО, z-score params только по train.
+Данные — LIGVideoDataset + split_dataset_by_video:
+  один CSV (с опциональной колонкой target_censored), split по видео, z-score params по train.
 
 Ключи батча:
   frame                         — [B, 3, 128, 128], float [0, 1]
   laser_params / params         — [B, 3] power, speed, distance (z-scored)
-  position / time               — [B, 1] относительная позиция в видео [0, 1]
+  position                      — [B, 1] нормированная позиция в видео [0, 1]
   target                        — [B, 1] сопротивление в кОм
+  target_censored               — [B, 1] bool; True если R >= 86 (в Excel было «-»)
 
-Один сэмпл = один кадр. Один mp4 → много кадров с одним R.
-Метрики: logs/regression_metrics.csv. Best по val MAE.
+Один сэмпл = один кадр. Лосс: one-sided censored MSE (потолок 86 кОм).
+Метрики: logs/regression_metrics.csv. Лучший чекпоинт — по val censored MSE.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Sampler, Subset
 
 _SRC_DIR = Path(__file__).resolve().parent
@@ -40,6 +40,12 @@ from cdae_model import (
     save_regressor,
 )
 from dataset import LIGVideoDataset, split_dataset_by_video
+from censored_loss import (
+    MAX_RESISTANCE_KOHM,
+    OneSidedCensoredMSELoss,
+    one_sided_censored_abs_error,
+    one_sided_censored_squared_error,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VIDEO_ROOT = Path("/home/jupyter/filestore/dataset")
@@ -51,20 +57,20 @@ IMAGE_SIZE = 128
 
 METRICS_FIELDS = [
     "epoch",
-    "train_huber",
+    "train_censored_mse",
     "train_mae",
-    "train_mse",
-    "train_r2",
-    "val_huber",
+    "train_mse_unc",
+    "train_r2_unc",
+    "val_censored_mse",
     "val_mae",
-    "val_mse",
-    "val_r2",
+    "val_mse_unc",
+    "val_r2_unc",
     "is_best",
 ]
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    """frame + laser_params/params + position/time + target."""
+    """frame + laser_params/params + position + target."""
     if not isinstance(batch, dict):
         raise TypeError(f"Ожидался dict-батч, получено {type(batch).__name__}")
 
@@ -79,19 +85,31 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.
         raise KeyError("В батче нет 'laser_params' / 'params' / 'process_params'")
 
     if "position" in batch:
-        time = batch["position"].to(device)
+        position = batch["position"].to(device)
     elif "time" in batch:
-        time = batch["time"].to(device)
+        position = batch["time"].to(device)
     else:
-        raise KeyError("В батче нет 'position' / 'time'")
+        raise KeyError("В батче нет 'position'")
 
     target = batch["target"].to(device)
+    if "target_censored" in batch:
+        target_censored = batch["target_censored"].to(device)
+    else:
+        target_censored = torch.zeros_like(target, dtype=torch.bool, device=device)
     if target.ndim == 1:
         target = target.unsqueeze(1)
-    if time.ndim == 1:
-        time = time.unsqueeze(1)
+    if target_censored.ndim == 1:
+        target_censored = target_censored.unsqueeze(1)
+    if position.ndim == 1:
+        position = position.unsqueeze(1)
 
-    return {"frame": frame, "params": params, "time": time, "target": target}
+    return {
+        "frame": frame,
+        "params": params,
+        "position": position,
+        "target": target,
+        "target_censored": target_censored,
+    }
 
 
 def _metrics_from_sums(
@@ -100,18 +118,21 @@ def _metrics_from_sums(
     sum_y: float,
     sum_y2: float,
     n: int,
-    huber_sum: float,
+    censored_mse_sum: float,
+    n_all: int,
 ) -> dict[str, float]:
-    if n <= 0:
+    if n_all <= 0:
         raise ValueError("пустой loader: нет сэмплов для метрик")
-    mse = sq_err / n
-    ss_tot = max(0.0, sum_y2 - (sum_y ** 2) / n)
-    r2 = 0.0 if ss_tot < 1e-12 else 1.0 - (sq_err / ss_tot)
+    mse_unc = sq_err / n if n > 0 else float("nan")
+    ss_tot = max(0.0, sum_y2 - (sum_y ** 2) / n) if n > 0 else 0.0
+    r2_unc = float("nan") if n <= 0 else (
+        0.0 if ss_tot < 1e-12 else 1.0 - (sq_err / ss_tot)
+    )
     return {
-        "huber": huber_sum / n,
-        "mae": abs_err / n,
-        "mse": mse,
-        "r2": r2,
+        "censored_mse": censored_mse_sum / n_all,
+        "mae": abs_err / n_all,
+        "mse_unc": mse_unc,
+        "r2_unc": r2_unc,
     }
 
 
@@ -120,35 +141,49 @@ def evaluate(
     model: ResistanceRegressor,
     loader: DataLoader,
     device: torch.device,
-    criterion: Optional[nn.Module] = None,
+    *,
+    censor_threshold: float = MAX_RESISTANCE_KOHM,
 ) -> dict[str, float]:
-    """Huber / MAE / MSE / R² по сопротивлению (кОм)."""
+    """One-sided censored MSE + MAE; MSE/R² — только на нецензурированных."""
     was_training = model.training
     encoder_was_training = model.encoder.training
     model.eval()
-    if criterion is None:
-        criterion = nn.HuberLoss(reduction="sum")
 
-    abs_err = sq_err = sum_y = sum_y2 = huber_sum = 0.0
-    n = 0
+    abs_err = sq_err = sum_y = sum_y2 = censored_mse_sum = 0.0
+    n_uncensored = 0
+    n_all = 0
 
     for batch in loader:
         b = _move_batch(batch, device)
-        pred = model(b["frame"], b["params"], b["time"])
+        pred = model(b["frame"], b["params"], b["position"])
         target = b["target"]
-        diff = pred - target
-        abs_err += diff.abs().sum().item()
-        sq_err += (diff ** 2).sum().item()
-        sum_y += target.sum().item()
-        sum_y2 += (target ** 2).sum().item()
-        huber_sum += criterion(pred, target).item()
-        n += target.numel()
+        censored = b["target_censored"]
+
+        sq = one_sided_censored_squared_error(
+            pred, target, censored, censor_threshold=censor_threshold
+        )
+        ae = one_sided_censored_abs_error(
+            pred, target, censored, censor_threshold=censor_threshold
+        )
+        censored_mse_sum += sq.sum().item()
+        abs_err += ae.sum().item()
+        n_all += target.numel()
+
+        uncensored = ~censored.bool()
+        if uncensored.any():
+            diff = pred[uncensored] - target[uncensored]
+            sq_err += (diff ** 2).sum().item()
+            sum_y += target[uncensored].sum().item()
+            sum_y2 += (target[uncensored] ** 2).sum().item()
+            n_uncensored += int(uncensored.sum().item())
 
     if was_training:
         model.train()
         model.encoder.train(encoder_was_training)
 
-    return _metrics_from_sums(abs_err, sq_err, sum_y, sum_y2, n, huber_sum)
+    return _metrics_from_sums(
+        abs_err, sq_err, sum_y, sum_y2, n_uncensored, censored_mse_sum, n_all
+    )
 
 
 def _set_train_modes(model: ResistanceRegressor) -> None:
@@ -171,14 +206,14 @@ def _append_metrics_csv(path: Path, row: dict[str, Any]) -> None:
 def _format_epoch_line(row: dict[str, Any]) -> str:
     parts = [
         f"epoch {int(row['epoch']):03d}",
-        f"train_huber={row['train_huber']:.4f}",
+        f"train_censored_mse={row['train_censored_mse']:.4f}",
         f"train_mae={row['train_mae']:.4f}",
-        f"train_mse={row['train_mse']:.4f}",
-        f"train_r2={row['train_r2']:.4f}",
-        f"val_huber={row['val_huber']:.4f}",
+        f"train_mse_unc={row['train_mse_unc']:.4f}",
+        f"train_r2_unc={row['train_r2_unc']:.4f}",
+        f"val_censored_mse={row['val_censored_mse']:.4f}",
         f"val_mae={row['val_mae']:.4f}",
-        f"val_mse={row['val_mse']:.4f}",
-        f"val_r2={row['val_r2']:.4f}",
+        f"val_mse_unc={row['val_mse_unc']:.4f}",
+        f"val_r2_unc={row['val_r2_unc']:.4f}",
     ]
     if row.get("is_best"):
         parts.append("[best saved]")
@@ -267,8 +302,8 @@ def train_regression(
     test_loader: Optional[DataLoader] = None,
 ) -> ResistanceRegressor:
     """
-    load CDAE → freeze encoder → Huber на R[кОм] →
-    evaluate train/val → best по val MAE → вернуть best-веса.
+    CDAE → замороженный encoder → one-sided censored MSE →
+    метрики train/val → лучший чекпоинт по val censored MSE.
     """
     if len(train_loader) == 0:
         raise ValueError("train_loader пустой")
@@ -282,22 +317,22 @@ def train_regression(
     _init_metrics_csv(metrics_csv)
 
     cdae = load_cdae(cdae_ckpt, map_location=device)
-    model = build_regressor_from_cdae(cdae, freeze_encoder=True, use_time=True)
+    model = build_regressor_from_cdae(cdae, freeze_encoder=True, use_position=True)
     model.to(device)
     _set_train_modes(model)
 
-    criterion = nn.HuberLoss()
-    criterion_sum = nn.HuberLoss(reduction="sum")
+    criterion = OneSidedCensoredMSELoss(censor_threshold=MAX_RESISTANCE_KOHM)
     optimizer = torch.optim.Adam(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr,
     )
 
-    best_mae = float("inf")
+    best_censored_mse = float("inf")
     saved_once = False
 
     print(f"метрики по эпохам → {metrics_csv}", flush=True)
     print(f"cdae_ckpt={cdae_ckpt}", flush=True)
+    print(f"censor_threshold={MAX_RESISTANCE_KOHM} kOhm", flush=True)
     print(f"epochs={epochs}  device={device}", flush=True)
 
     for epoch in range(epochs):
@@ -323,8 +358,8 @@ def train_regression(
 
         for batch_index, batch in enumerate(train_loader):
             b = _move_batch(batch, device)
-            pred = model(b["frame"], b["params"], b["time"])
-            loss = criterion(pred, b["target"])
+            pred = model(b["frame"], b["params"], b["position"])
+            loss = criterion(pred, b["target"], b["target_censored"])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -334,30 +369,31 @@ def train_regression(
                 or (batch_index + 1) == n_batches
             ):
                 print(
-                    f"  batch {batch_index + 1}/{n_batches}  huber={loss.item():.4f}",
+                    f"  batch {batch_index + 1}/{n_batches}  "
+                    f"censored_mse={loss.item():.4f}",
                     flush=True,
                 )
 
-        train_m = evaluate(model, train_loader, device, criterion=criterion_sum)
-        val_m = evaluate(model, val_loader, device, criterion=criterion_sum)
+        train_m = evaluate(model, train_loader, device)
+        val_m = evaluate(model, val_loader, device)
 
         is_best = 0
-        if val_m["mae"] < best_mae:
-            best_mae = val_m["mae"]
+        if val_m["censored_mse"] < best_censored_mse:
+            best_censored_mse = val_m["censored_mse"]
             save_regressor(model, out_ckpt, cdae=cdae, extra_config=extra_config)
             saved_once = True
             is_best = 1
 
         row: dict[str, Any] = {
             "epoch": epoch,
-            "train_huber": train_m["huber"],
+            "train_censored_mse": train_m["censored_mse"],
             "train_mae": train_m["mae"],
-            "train_mse": train_m["mse"],
-            "train_r2": train_m["r2"],
-            "val_huber": val_m["huber"],
+            "train_mse_unc": train_m["mse_unc"],
+            "train_r2_unc": train_m["r2_unc"],
+            "val_censored_mse": val_m["censored_mse"],
             "val_mae": val_m["mae"],
-            "val_mse": val_m["mse"],
-            "val_r2": val_m["r2"],
+            "val_mse_unc": val_m["mse_unc"],
+            "val_r2_unc": val_m["r2_unc"],
             "is_best": is_best,
         }
         _append_metrics_csv(metrics_csv, row)
@@ -370,15 +406,17 @@ def train_regression(
         model = load_regressor(out_ckpt, cdae=cdae, map_location=device)
         model.to(device)
         print(
-            f"лучший чекпоинт (по val MAE): {out_ckpt}  mae={best_mae:.4f}",
+            f"лучший чекпоинт (val censored MSE): {out_ckpt}  "
+            f"censored_mse={best_censored_mse:.4f}",
             flush=True,
         )
 
     if test_loader is not None and len(test_loader) > 0:
-        test_m = evaluate(model, test_loader, device, criterion=criterion_sum)
+        test_m = evaluate(model, test_loader, device)
         print(
-            f"test  huber={test_m['huber']:.4f}  "
-            f"mae={test_m['mae']:.4f}  mse={test_m['mse']:.4f}  r2={test_m['r2']:.4f}",
+            f"test  censored_mse={test_m['censored_mse']:.4f}  "
+            f"mae={test_m['mae']:.4f}  "
+            f"mse_unc={test_m['mse_unc']:.4f}  r2_unc={test_m['r2_unc']:.4f}",
             flush=True,
         )
 
@@ -452,6 +490,19 @@ def main() -> None:
         frame_size=(IMAGE_SIZE, IMAGE_SIZE),
         position_step=args.position_step,
     )
+    if "target_censored" not in dataset.metadata.columns:
+        print(
+            "[WARN] В CSV нет колонки target_censored — все таргеты считаются "
+            "нецензурированными. Пересоберите metadata через parser.py.",
+            flush=True,
+        )
+    else:
+        n_cens = int(dataset.metadata["target_censored"].fillna(0).astype(int).sum())
+        print(
+            f"Censored videos in CSV: {n_cens} / {len(dataset.metadata)}",
+            flush=True,
+        )
+
     train_dataset, val_dataset, test_dataset, split_info = split_dataset_by_video(
         dataset,
         seed=args.seed,
@@ -465,6 +516,7 @@ def main() -> None:
         "laser_std": laser_std,
         "position_step": float(args.position_step),
         "split_seed": int(args.seed),
+        "censor_threshold_kOhm": float(MAX_RESISTANCE_KOHM),
     }
 
     norm_path = Path(args.metrics_csv).with_name("regression_norm.json")

@@ -28,11 +28,11 @@ class TemporalResistanceRegressor(nn.Module):
     """
     CDAE encoder на каждый кадр окна → Transformer → голова → R.
 
-    forward(frames, params, time=None, frame_mask=None) -> [B, 1]
+    forward(frames, params, position=None, frame_mask=None) -> [B, 1]
 
     frames:      [B, T, 3, H, W]  последние T кадров, последний = текущий
-    params:      [B, 3]             z-scored мощность, скорость, толщина
-    time:        [B, 1]             t / duration (момент последнего кадра)
+    params:      [B, 3]             z-scored [power, speed, distance_um]
+    position:    [B, 1]             нормированная позиция последнего кадра в [0, 1]
     frame_mask:  [B, T] bool, True = реальный кадр; False = padding в начале видео
     """
 
@@ -50,7 +50,7 @@ class TemporalResistanceRegressor(nn.Module):
         num_params: int = NUM_PROCESS_PARAMS,
         param_emb_dim: int = 32,
         hidden_dim: int = 256,
-        use_time: bool = True,
+        use_position: bool = True,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
@@ -59,7 +59,7 @@ class TemporalResistanceRegressor(nn.Module):
 
         self.encoder = encoder
         self.window_size = window_size
-        self.use_time = use_time
+        self.use_position = use_position
         self.latent_channels = latent_channels
         self.d_model = d_model
 
@@ -90,7 +90,7 @@ class TemporalResistanceRegressor(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        param_in = num_params + (1 if use_time else 0)
+        param_in = num_params + (1 if use_position else 0)
         self.param_proj = nn.Sequential(
             nn.Linear(param_in, param_emb_dim),
             nn.ReLU(inplace=True),
@@ -119,7 +119,7 @@ class TemporalResistanceRegressor(nn.Module):
         self,
         frames: torch.Tensor,
         params: torch.Tensor,
-        time: Optional[torch.Tensor] = None,
+        position: Optional[torch.Tensor] = None,
         frame_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if frames.ndim != 5:
@@ -150,10 +150,10 @@ class TemporalResistanceRegressor(nn.Module):
         else:
             pooled = temporal[:, -1, :]
 
-        if self.use_time:
-            if time is None:
-                raise ValueError("time [B, 1] обязателен при use_time=True")
-            cond = torch.cat([params, time], dim=1)
+        if self.use_position:
+            if position is None:
+                raise ValueError("position [B, 1] обязателен при use_position=True")
+            cond = torch.cat([params, position], dim=1)
         else:
             cond = params
 
@@ -177,14 +177,14 @@ def build_temporal_regressor_from_cdae(
     *,
     freeze_encoder: bool = True,
     window_size: int = DEFAULT_WINDOW_SIZE,
-    use_time: bool = True,
+    use_position: bool = True,
     **kwargs,
 ) -> TemporalResistanceRegressor:
     kwargs.setdefault("latent_channels", cdae.latent_channels)
     model = TemporalResistanceRegressor(
         encoder=cdae.encoder,
         window_size=window_size,
-        use_time=use_time,
+        use_position=use_position,
         **kwargs,
     )
     if freeze_encoder:
@@ -196,6 +196,7 @@ def save_temporal_regressor(
     model: TemporalResistanceRegressor,
     path: PathLike,
     cdae: Optional[CDAE] = None,
+    extra_config: Optional[dict] = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +206,7 @@ def save_temporal_regressor(
     cfg = {
         "model_type": "temporal_transformer",
         "window_size": model.window_size,
-        "use_time": model.use_time,
+        "use_position": model.use_position,
         "latent_channels": model.latent_channels,
         "d_model": model.d_model,
         "freeze_encoder": not model.encoder_trainable(),
@@ -220,6 +221,8 @@ def save_temporal_regressor(
         "hidden_dim": model.head[0].out_features,
         "dropout": float(model.frame_proj[3].p),
     }
+    if extra_config:
+        cfg.update(extra_config)
     torch.save({"state_dict": model.state_dict(), "config": cfg}, path)
 
 
@@ -240,10 +243,11 @@ def load_temporal_regressor(
             base_channels=cfg.get("base_channels", 32),
         )
 
+    use_position = cfg.get("use_position", cfg.get("use_time", True))
     model = build_temporal_regressor_from_cdae(
         cdae,
         freeze_encoder=cfg.get("freeze_encoder", True),
-        use_time=cfg.get("use_time", True),
+        use_position=use_position,
         window_size=cfg.get("window_size", DEFAULT_WINDOW_SIZE),
         latent_channels=cfg.get("latent_channels", cdae.latent_channels),
         frame_emb_dim=cfg.get("frame_emb_dim", 128),

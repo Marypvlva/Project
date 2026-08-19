@@ -8,7 +8,7 @@ CDAE-претрейн + регрессор сопротивления для on-
   - модель однокадровая; временные окна / шаг по кадрам — на стороне датасета
 
 Параметры процесса
-  - [мощность, скорость, толщина], форма [B, 3]
+  - [мощность, скорость, distance_um], форма [B, 3]
   - ОБЯЗАТЕЛЬНО стандартизовать заранее (mean/std по train); сырые единицы ломают MLP
 
 Таргет
@@ -23,7 +23,7 @@ import torch.nn as nn
 
 DEFAULT_IMG_SIZE = 128
 IN_CHANNELS = 3
-NUM_PROCESS_PARAMS = 3  # мощность, скорость, толщина
+NUM_PROCESS_PARAMS = 3  # мощность, скорость, distance_um (мкм)
 
 PathLike = Union[str, Path]
 
@@ -112,7 +112,7 @@ class ResistanceRegressor(nn.Module):
     Encoder из CDAE (freeze/finetune) + параметры процесса (+ опционально прогресс)
     → сопротивление R [кОм].
 
-    forward(frame, params, time=None) -> [B, 1]
+    forward(frame, params, position=None) -> [B, 1]
     """
 
     def __init__(
@@ -124,12 +124,12 @@ class ResistanceRegressor(nn.Module):
         img_emb_dim: int = 128,
         param_emb_dim: int = 32,
         hidden_dim: int = 256,
-        use_time: bool = True,
+        use_position: bool = True,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.use_time = use_time
+        self.use_position = use_position
         self.latent_channels = latent_channels
 
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -140,7 +140,7 @@ class ResistanceRegressor(nn.Module):
             nn.Dropout(dropout),
         )
 
-        param_in = num_params + (1 if use_time else 0)
+        param_in = num_params + (1 if use_position else 0)
         self.param_proj = nn.Sequential(
             nn.Linear(param_in, param_emb_dim),
             nn.ReLU(inplace=True),
@@ -166,21 +166,21 @@ class ResistanceRegressor(nn.Module):
         self,
         frame: torch.Tensor,
         params: torch.Tensor,
-        time: Optional[torch.Tensor] = None,
+        position: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Аргументы:
-            frame:  [B, 3, H, W] в [0, 1]
-            params: [B, 3] стандартизованные параметры процесса
-            time:   [B, 1] прогресс процесса в [0, 1] (elapsed / duration).
-                    Обязателен при use_time=True; иначе игнорируется.
+            frame:    [B, 3, H, W] в [0, 1]
+            params:   [B, 3] z-scored [power, speed, distance_um]
+            position: [B, 1] нормированная позиция в видео [0, 1] (не секунды).
+                      Обязателен при use_position=True; иначе игнорируется.
         """
         img_emb = self.encode_frame(frame)
 
-        if self.use_time:
-            if time is None:
-                raise ValueError("time [B, 1] обязателен при use_time=True")
-            cond = torch.cat([params, time], dim=1)
+        if self.use_position:
+            if position is None:
+                raise ValueError("position [B, 1] обязателен при use_position=True")
+            cond = torch.cat([params, position], dim=1)
         else:
             cond = params
 
@@ -206,14 +206,14 @@ def build_regressor_from_cdae(
     cdae: CDAE,
     *,
     freeze_encoder: bool = True,
-    use_time: bool = True,
+    use_position: bool = True,
     **regressor_kwargs,
 ) -> ResistanceRegressor:
     """Повесить регрессионную голову на (предобученный) encoder CDAE."""
     regressor_kwargs.setdefault("latent_channels", cdae.latent_channels)
     model = ResistanceRegressor(
         encoder=cdae.encoder,
-        use_time=use_time,
+        use_position=use_position,
         **regressor_kwargs,
     )
     if freeze_encoder:
@@ -279,10 +279,11 @@ def load_regressor(
                 img_size=cfg.get("img_size", DEFAULT_IMG_SIZE),
                 base_channels=cfg.get("base_channels", 32),
             )
+        use_position = cfg.get("use_position", cfg.get("use_time", True))
         model = build_regressor_from_cdae(
             cdae,
             freeze_encoder=cfg.get("freeze_encoder", True),
-            use_time=cfg.get("use_time", True),
+            use_position=use_position,
             latent_channels=cfg.get("latent_channels", cdae.latent_channels),
             img_emb_dim=cfg.get("img_emb_dim", 128),
             param_emb_dim=cfg.get("param_emb_dim", 32),
@@ -312,7 +313,7 @@ def save_regressor(
         cdae.latent_channels // 4 if cdae is not None else model.latent_channels // 4
     )
     cfg = {
-        "use_time": model.use_time,
+        "use_position": model.use_position,
         "latent_channels": model.latent_channels,
         "freeze_encoder": not model.encoder_trainable(),
         "in_channels": cdae.in_channels if cdae is not None else IN_CHANNELS,
