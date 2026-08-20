@@ -53,11 +53,14 @@ from transformer_model import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_VIDEO_ROOT = Path("/home/jupyter/filestore/dataset")
 DEFAULT_METADATA = DEFAULT_VIDEO_ROOT / "metadata.csv"
-DEFAULT_CDAE_CKPT = PROJECT_ROOT / "checkpoints" / "cdae_weights.pth"
-DEFAULT_OUT_CKPT = PROJECT_ROOT / "checkpoints" / "temporal_regressor.pt"
-DEFAULT_METRICS_CSV = PROJECT_ROOT / "logs" / "transformer_metrics.csv"
+DEFAULT_CHECKPOINT_DIR = Path("/home/jupyter/filestore/checkpoints")
+DEFAULT_CDAE_CKPT = (DEFAULT_CHECKPOINT_DIR / "cdae_weights.pth")
+DEFAULT_BEST_CKPT = (DEFAULT_CHECKPOINT_DIR / "temporal_regressor_best.pt")
+DEFAULT_LAST_CKPT = (DEFAULT_CHECKPOINT_DIR / "temporal_regressor_last.pth")
+DEFAULT_METRICS_CSV = (PROJECT_ROOT / "logs" / "transformer_metrics.csv")
 IMAGE_SIZE = 128
 
 METRICS_FIELDS = [
@@ -229,8 +232,10 @@ def _set_train_modes(model: TemporalResistanceRegressor) -> None:
         model.encoder.eval()
 
 
-def _init_metrics_csv(path: Path) -> None:
+def _init_metrics_csv(path: Path, *, overwrite: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        return
     with path.open("w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=METRICS_FIELDS).writeheader()
 
@@ -277,14 +282,69 @@ def _make_loader(
         kwargs["shuffle"] = False
     return DataLoader(subset, **kwargs)
 
+def save_training_checkpoint(
+    model: TemporalResistanceRegressor, optimizer: torch.optim.Optimizer,
+    epoch: int, best_censored_mse: float, path: str | Path) -> None:
+    """
+    сначала полностью записываем temporal_regressor_last.pth.tmp
+                                      ↓
+    только после успешной записи заменяем last.pth
+    """
+    
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_censored_mse": best_censored_mse,
+            "encoder_trainable": model.encoder_trainable(),
+        },
+        temp_path,
+    )
+
+    temp_path.replace(path)
+
+
+def load_training_checkpoint(path: str | Path, device: torch.device) -> dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Training checkpoint not found: {path}")
+    return torch.load(path, map_location=device)
+
+def rebuild_optimizer_after_unfreeze(
+    model: TemporalResistanceRegressor,
+    old_optimizer: torch.optim.Optimizer, *, lr: float,
+    encoder_lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    new_optimizer = build_adamw(
+        model, lr=lr, weight_decay=weight_decay, encoder_lr=encoder_lr,
+    )
+
+    new_params = {
+        param
+        for group in new_optimizer.param_groups
+        for param in group["params"]
+    }
+
+    for param, state in old_optimizer.state.items():
+        if param in new_params:
+            new_optimizer.state[param] = state
+
+    return new_optimizer
+
 
 def train_transformer(
     train_loader: DataLoader,
     val_loader: DataLoader,
     *,
     cdae_ckpt: str | Path = DEFAULT_CDAE_CKPT,
-    out_ckpt: str | Path = DEFAULT_OUT_CKPT,
+    best_ckpt: str | Path = DEFAULT_BEST_CKPT,
+    last_ckpt: str | Path = DEFAULT_LAST_CKPT,
     metrics_csv: str | Path = DEFAULT_METRICS_CSV,
+    resume: bool = False,
     window_size: int = DEFAULT_WINDOW_SIZE,
     epochs: int = 20,
     lr: float = 1e-4,
@@ -295,6 +355,7 @@ def train_transformer(
     label_weight_gamma: float = 2.0,
     extra_config: Optional[dict[str, Any]] = None,
     test_loader: Optional[DataLoader] = None,
+    overwrite: bool = False,
 ) -> TemporalResistanceRegressor:
     if len(train_loader) == 0:
         raise ValueError("train_loader пустой")
@@ -302,26 +363,117 @@ def train_transformer(
         raise ValueError("val_loader пустой")
 
     device = torch.device(device)
-    out_ckpt = Path(out_ckpt)
-    metrics_csv = Path(metrics_csv)
-    extra_config = extra_config or {}
-    _init_metrics_csv(metrics_csv)
 
-    cdae = load_cdae(cdae_ckpt, map_location=device)
+    best_ckpt = Path(best_ckpt)
+    last_ckpt = Path(last_ckpt)
+    metrics_csv = Path(metrics_csv)
+    norm_path = metrics_csv.with_name("transformer_norm.json")
+
+    extra_config = extra_config or {}
+
+    cdae = load_cdae(
+        cdae_ckpt,
+        map_location=device,
+    )
+
     model = build_temporal_regressor_from_cdae(
         cdae,
         freeze_encoder=True,
         use_position=True,
         window_size=window_size,
     )
+
     model.to(device)
-    _set_train_modes(model)
 
-    criterion = OneSidedCensoredMSELoss(censor_threshold=MAX_RESISTANCE_KOHM)
-    optimizer = build_adamw(model, lr=lr, weight_decay=weight_decay)
+    criterion = OneSidedCensoredMSELoss(
+        censor_threshold=MAX_RESISTANCE_KOHM
+    )
 
+    start_epoch = 1
     best_censored_mse = float("inf")
-    saved_once = False
+
+
+    # ------------------------------------------------------------
+    # Resume
+    # ------------------------------------------------------------
+    """
+    без --resume / --overwrite
+        │
+        ├─ никаких старых файлов → начинаем
+        │
+        └─ хоть один старый файл → STOP
+
+
+    --overwrite
+            │
+            ├─ удалить best
+            ├─ удалить last
+            ├─ удалить metrics.csv
+            ├─ удалить norm.json
+            └─ начать с эпохи 1
+
+
+    --resume
+            │
+            ├─ загрузить last
+            ├─ НЕ трогать старый metrics.csv
+            ├─ НЕ трогать norm.json
+            └─ продолжить со следующей эпохи
+    """
+    
+    if resume and overwrite:
+        raise ValueError(
+            "--resume и --overwrite нельзя использовать одновременно."
+        )
+
+    if not resume:
+        experiment_files = (best_ckpt, last_ckpt, metrics_csv, norm_path)
+
+        existing_files = [
+            path
+            for path in experiment_files
+            if path.exists()
+        ]
+
+        if existing_files and not overwrite:
+            paths = "\n".join(str(path) for path in existing_files)
+
+            raise FileExistsError(
+                f"Найдены файлы предыдущего обучения:\n{paths}\nИспользуйте --resume для продолжения или --overwrite для нового обучения.")
+
+        if overwrite:
+            for path in experiment_files:
+                path.unlink(missing_ok=True)   
+
+    if resume:
+        checkpoint = load_training_checkpoint(last_ckpt, device)
+        if checkpoint.get("encoder_trainable", False):
+            model.unfreeze_encoder()
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if model.encoder_trainable():
+            optimizer = build_adamw(model, lr=lr, weight_decay=weight_decay, encoder_lr=encoder_lr)
+        else:
+            optimizer = build_adamw(model, lr=lr, weight_decay=weight_decay)
+        
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_censored_mse = float(checkpoint["best_censored_mse"])
+        _init_metrics_csv(metrics_csv, overwrite=False)
+        print(f"Resume from epoch {start_epoch}", flush=True)
+        print(f"Best val censored MSE: {best_censored_mse:.6f}", flush=True)
+
+
+    # ------------------------------------------------------------
+    # Новый эксперимент
+    # ------------------------------------------------------------
+
+    else:
+        optimizer = build_adamw(model, lr=lr, weight_decay=weight_decay)
+        _init_metrics_csv(metrics_csv, overwrite=False)
+        norm_path.parent.mkdir(parents=True, exist_ok=True)
+        with norm_path.open("w", encoding="utf-8") as f:
+            json.dump(extra_config, f, indent=2, ensure_ascii=False)
+        print(f"laser mean/std → {norm_path}", flush=True)
 
     print(f"метрики → {metrics_csv}", flush=True)
     print(f"cdae_ckpt={cdae_ckpt}", flush=True)
@@ -331,13 +483,19 @@ def train_transformer(
     print(f"weight_decay={weight_decay}  label_weight_gamma={label_weight_gamma}", flush=True)
     print(f"unfreeze_after={unfreeze_encoder_after}", flush=True)
 
-    for epoch in range(epochs):
-        if unfreeze_encoder_after is not None and epoch == unfreeze_encoder_after:
+    for epoch in range(start_epoch, epochs + 1):
+        if (
+            unfreeze_encoder_after is not None
+            and not model.encoder_trainable()
+            and epoch > unfreeze_encoder_after
+        ):
             model.unfreeze_encoder()
-            optimizer = build_adamw(
-                model, lr=lr, weight_decay=weight_decay, encoder_lr=encoder_lr
+            optimizer = rebuild_optimizer_after_unfreeze(
+                model=model, old_optimizer=optimizer,
+                lr=lr, encoder_lr=encoder_lr, weight_decay=weight_decay,
             )
-            print(f"[epoch {epoch}] encoder разморожен, lr={encoder_lr}", flush=True)
+            print(f"[epoch {epoch}] encoder разморожен, encoder_lr={encoder_lr}",flush=True)
+            
 
         _set_train_modes(model)
         n_batches = len(train_loader)
@@ -377,9 +535,15 @@ def train_transformer(
         is_best = 0
         if val_m["censored_mse"] < best_censored_mse:
             best_censored_mse = val_m["censored_mse"]
-            save_temporal_regressor(model, out_ckpt, cdae=cdae, extra_config=extra_config)
-            saved_once = True
+            save_temporal_regressor(
+                model, best_ckpt, cdae=cdae,
+                extra_config=extra_config,
+            )
             is_best = 1
+            print(
+                f"  best checkpoint → {best_ckpt}",
+                flush=True,
+            )
 
         row: dict[str, Any] = {
             "epoch": epoch,
@@ -395,18 +559,21 @@ def train_transformer(
         }
         _append_metrics_csv(metrics_csv, row)
         print(_format_epoch_line(row), flush=True)
-
-    if not saved_once:
-        save_temporal_regressor(model, out_ckpt, cdae=cdae, extra_config=extra_config)
-        print(f"сохранено (fallback): {out_ckpt}", flush=True)
-    else:
-        model = load_temporal_regressor(out_ckpt, cdae=cdae, map_location=device)
-        model.to(device)
-        print(
-            f"лучший чекпоинт (val censored MSE): {out_ckpt}  "
-            f"censored_mse={best_censored_mse:.4f}",
-            flush=True,
+        save_training_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            best_censored_mse=best_censored_mse,
+            path=last_ckpt,
         )
+
+    if best_ckpt.exists():
+        model = load_temporal_regressor(
+            best_ckpt, cdae=cdae, map_location=device,
+        )
+        model.to(device)
+        print(f"Лучший checkpoint: {best_ckpt}", flush=True)
+        print(f"Best val censored MSE: {best_censored_mse:.4f}", flush=True)
 
     if test_loader is not None and len(test_loader) > 0:
         test_m = evaluate(
@@ -428,7 +595,10 @@ def build_argparser() -> argparse.ArgumentParser:
         description="Temporal Transformer-регрессор поверх CDAE (окно последних кадров)"
     )
     p.add_argument("--cdae-ckpt", type=Path, default=DEFAULT_CDAE_CKPT)
-    p.add_argument("--out-ckpt", type=Path, default=DEFAULT_OUT_CKPT)
+    p.add_argument("--best-ckpt", type=Path, default=DEFAULT_BEST_CKPT)
+    p.add_argument("--last-ckpt", type=Path, default=DEFAULT_LAST_CKPT)
+    p.add_argument("--resume", action="store_true", help="Продолжить обучение из last checkpoint.")
+    p.add_argument("--overwrite", action="store_true", help="Начать новый эксперимент, удалив старые checkpoints и логи.")
     p.add_argument("--metrics-csv", type=Path, default=DEFAULT_METRICS_CSV)
     p.add_argument("--metadata", type=Path, default=DEFAULT_METADATA)
     p.add_argument("--video-dir", type=Path, default=DEFAULT_VIDEO_ROOT)
@@ -447,7 +617,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--unfreeze-after",
         type=int,
         default=5,
-        help="Эпоха разморозки encoder. -1 = не размораживать.",
+        help=("Число первых эпох с frozen encoder. 5 = разморозить перед эпохой 6. -1 = не размораживать."),
     )
     p.add_argument(
         "--weight-decay",
@@ -549,12 +719,6 @@ def main() -> None:
         "progress_feature": "scan_mm",
     }
 
-    norm_path = Path(args.metrics_csv).with_name("transformer_norm.json")
-    norm_path.parent.mkdir(parents=True, exist_ok=True)
-    with norm_path.open("w", encoding="utf-8") as f:
-        json.dump(extra_config, f, indent=2, ensure_ascii=False)
-    print(f"laser mean/std → {norm_path}", flush=True)
-
     pin_memory = str(args.device).startswith("cuda")
     train_loader = _make_loader(
         train_dataset,
@@ -585,18 +749,25 @@ def main() -> None:
         train_loader,
         val_loader,
         cdae_ckpt=args.cdae_ckpt,
-        out_ckpt=args.out_ckpt,
+        best_ckpt=args.best_ckpt,
+        last_ckpt=args.last_ckpt,
         metrics_csv=args.metrics_csv,
+        resume=args.resume,
         window_size=args.window_size,
         epochs=args.epochs,
         lr=args.lr,
         device=args.device,
-        unfreeze_encoder_after=args.unfreeze_after if args.unfreeze_after >= 0 else None,
+        unfreeze_encoder_after=(
+            args.unfreeze_after
+            if args.unfreeze_after >= 0
+            else None
+        ),
         encoder_lr=args.encoder_lr,
         weight_decay=args.weight_decay,
         label_weight_gamma=args.label_weight_gamma,
         extra_config=extra_config,
         test_loader=test_loader,
+        overwrite=args.overwrite,
     )
 
 
